@@ -7,7 +7,7 @@ const fs = require('fs');
 const os = require('os');
 
 console.log('═══════════════════════════════════════════════');
-console.log('    🖥️  MSL Process - Modo Escritorio');
+console.log('       MSL Process - Modo Escritorio');
 console.log('═══════════════════════════════════════════════\n');
 
 const JULIA_PORT = 8000;
@@ -20,20 +20,20 @@ const isWindows = os.platform() === 'win32';
 
 // Detectar número de cores
 const numCores = os.cpus().length;
-console.log(`🧵 CPU Cores detectados: ${numCores}`);
-console.log(`💻 Sistema operativo: ${os.platform()}\n`);
+console.log(` CPU Cores detectados: ${numCores}`);
+console.log(` Sistema operativo: ${os.platform()}\n`);
 
 // 1. Verificar que los directorios existan
 if (!fs.existsSync(BACKEND_DIR)) {
-    console.error('❌ Error: No se encontró el directorio backend');
+    console.error(' Error: No se encontró el directorio backend');
     console.error(`   Buscado en: ${BACKEND_DIR}`);
     process.exit(1);
 }
 
 if (!fs.existsSync(FRONTEND_DIR)) {
-    console.error('❌ Error: No se encontró el frontend compilado');
+    console.error(' Error: No se encontró el frontend compilado');
     console.error(`   Buscado en: ${FRONTEND_DIR}`);
-    console.error('\n💡 Solución:');
+    console.error('\n Solución:');
     console.error('   1. cd frontend');
     console.error('   2. npm install');
     console.error('   3. npm run build');
@@ -41,7 +41,7 @@ if (!fs.existsSync(FRONTEND_DIR)) {
 }
 
 // 2. Iniciar servidor Julia
-console.log('🔷 Iniciando servidor Julia (modo escritorio)...');
+console.log(' Iniciando servidor Julia (modo escritorio)...');
 
 const startScript = isWindows 
     ? path.join(BACKEND_DIR, 'scripts', 'start-desktop.ps1')
@@ -66,18 +66,18 @@ juliaProcess.stderr.on('data', (data) => {
 });
 
 juliaProcess.on('close', (code) => {
-    console.log(`\n❌ Servidor Julia cerrado con código ${code}`);
+    console.log(`\n Servidor Julia cerrado con código ${code}`);
     process.exit(code);
 });
 
 // 3. Esperar a que Julia esté listo
 function waitForJulia() {
     return new Promise((resolve) => {
-        console.log('⏳ Esperando a que Julia esté listo...');
+        console.log(' Esperando a que Julia esté listo...');
         const checkJulia = () => {
             http.get(`http://localhost:${JULIA_PORT}/api/test`, (res) => {
                 if (res.statusCode === 200) {
-                    console.log('✅ Servidor Julia listo\n');
+                    console.log(' Servidor Julia listo\n');
                     resolve();
                 } else {
                     setTimeout(checkJulia, 500);
@@ -105,10 +105,10 @@ function startFrontendServer() {
     
     app.listen(FRONTEND_PORT, 'localhost', () => {
         console.log('═══════════════════════════════════════════════');
-        console.log('✅ MSL Process está listo');
+        console.log('    MSL Process está listo');
         console.log('═══════════════════════════════════════════════');
-        console.log(`🌐 Frontend: http://localhost:${FRONTEND_PORT}`);
-        console.log(`🔷 Backend:  http://localhost:${JULIA_PORT}`);
+        console.log(`    Frontend: http://localhost:${FRONTEND_PORT}`);
+        console.log(`    Backend:  http://localhost:${JULIA_PORT}`);
         console.log('═══════════════════════════════════════════════');
         console.log('\n💡 Presiona Ctrl+C para cerrar\n');
         
@@ -124,20 +124,20 @@ function startFrontendServer() {
         await waitForJulia();
         startFrontendServer();
     } catch (error) {
-        console.error('❌ Error iniciando MSL Process:', error);
+        console.error(' Error iniciando MSL Process:', error);
         process.exit(1);
     }
 })();
 
 // 6. Manejo de cierre limpio
 process.on('SIGINT', () => {
-    console.log('\n\n🛑 Cerrando MSL Process...');
+    console.log('\n\n Cerrando MSL Process...');
     juliaProcess.kill();
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n\n🛑 Cerrando MSL Process...');
+    console.log('\n\n Cerrando MSL Process...');
     juliaProcess.kill();
     process.exit(0);
 });

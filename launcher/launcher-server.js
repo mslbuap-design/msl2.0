@@ -7,7 +7,7 @@ const fs = require('fs');
 const os = require('os');
 
 console.log('═══════════════════════════════════════════════');
-console.log('    🌐 MSL Process - Modo Servidor (Red Local)');
+console.log('   MSL Process - Modo Servidor (Red Local)');
 console.log('═══════════════════════════════════════════════\n');
 
 const JULIA_PORT = 8000;
@@ -38,14 +38,14 @@ console.log(`📡 URL para clientes: http://${localIP}:${FRONTEND_PORT}\n`);
 
 // 1. Verificar directorios
 if (!fs.existsSync(BACKEND_DIR)) {
-    console.error('❌ Error: No se encontró el directorio backend');
+    console.error(' Error: No se encontró el directorio backend');
     process.exit(1);
 }
 
 if (!fs.existsSync(FRONTEND_DIR)) {
-    console.error('❌ Error: No se encontró el frontend compilado para servidor');
+    console.error(' Error: No se encontró el frontend compilado para servidor');
     console.error(`   Buscado en: ${FRONTEND_DIR}`);
-    console.error('\n💡 Solución:');
+    console.error('\n Solución:');
     console.error('   cd frontend');
     console.error('   cp .env.server .env');
     console.error('   npm run build');
@@ -54,7 +54,7 @@ if (!fs.existsSync(FRONTEND_DIR)) {
 }
 
 // 2. Iniciar Julia en modo servidor
-console.log('🔷 Iniciando servidor Julia (modo red)...');
+console.log(' Iniciando servidor Julia (modo red)...');
 
 const startScript = path.join(BACKEND_DIR, 'scripts', 'start-server.sh');
 
@@ -73,18 +73,18 @@ juliaProcess.stderr.on('data', (data) => {
 });
 
 juliaProcess.on('close', (code) => {
-    console.log(`\n❌ Servidor Julia cerrado con código ${code}`);
+    console.log(`\n Servidor Julia cerrado con código ${code}`);
     process.exit(code);
 });
 
 // 3. Esperar a Julia
 function waitForJulia() {
     return new Promise((resolve) => {
-        console.log('⏳ Esperando a que Julia esté listo...');
+        console.log(' Esperando a que Julia esté listo...');
         const checkJulia = () => {
             http.get(`http://localhost:${JULIA_PORT}/api/test`, (res) => {
                 if (res.statusCode === 200) {
-                    console.log('✅ Servidor Julia listo\n');
+                    console.log(' Servidor Julia listo\n');
                     resolve();
                 } else {
                     setTimeout(checkJulia, 500);
@@ -119,15 +119,15 @@ function startFrontendServer() {
     // Escuchar en toda la red (0.0.0.0)
     app.listen(FRONTEND_PORT, '0.0.0.0', () => {
         console.log('═══════════════════════════════════════════════');
-        console.log('✅ MSL Process Servidor está listo');
+        console.log('     MSL Process Servidor está listo');
         console.log('═══════════════════════════════════════════════');
-        console.log(`🌐 Acceso local:  http://localhost:${FRONTEND_PORT}`);
-        console.log(`📡 Acceso red:    http://${localIP}:${FRONTEND_PORT}`);
-        console.log(`🔷 Backend Julia: http://${localIP}:${JULIA_PORT}`);
+        console.log(` Acceso local:  http://localhost:${FRONTEND_PORT}`);
+        console.log(` Acceso red:    http://${localIP}:${FRONTEND_PORT}`);
+        console.log(` Backend Julia: http://${localIP}:${JULIA_PORT}`);
         console.log('═══════════════════════════════════════════════');
-        console.log('\n📱 Dispositivos en la red pueden acceder desde:');
+        console.log('\n Dispositivos en la red pueden acceder desde:');
         console.log(`   http://${localIP}:${FRONTEND_PORT}\n`);
-        console.log('💡 Presiona Ctrl+C para cerrar\n');
+        console.log(' Presiona Ctrl+C para cerrar\n');
     });
 }
 
@@ -137,20 +137,20 @@ function startFrontendServer() {
         await waitForJulia();
         startFrontendServer();
     } catch (error) {
-        console.error('❌ Error iniciando servidor:', error);
+        console.error(' Error iniciando servidor:', error);
         process.exit(1);
     }
 })();
 
 // 6. Manejo de cierre
 process.on('SIGINT', () => {
-    console.log('\n\n🛑 Cerrando servidor MSL Process...');
+    console.log('\n\n Cerrando servidor MSL Process...');
     juliaProcess.kill();
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n\n🛑 Cerrando servidor MSL Process...');
+    console.log('\n\n Cerrando servidor MSL Process...');
     juliaProcess.kill();
     process.exit(0);
 });
