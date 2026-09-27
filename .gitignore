@@ -1,0 +1,14 @@
+﻿# postgres_data/
+# backend_data/
+
+# Projects / results
+# projects/
+# output/
+
+# Cache
+# cache/
+# MSL user projects and generated results
+projects/*
+!projects/.gitkeep
+notas/*
+cache/*

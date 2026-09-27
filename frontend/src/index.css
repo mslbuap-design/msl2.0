@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg text-ink antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Los valores numéricos (cortes, dimensiones, p-valores, features) siempre
+     en monoespaciada: es dato, no texto de interfaz. */
+  .font-data {
+    @apply font-mono tabular-nums;
+  }
+
+  ::selection {
+    @apply bg-accent-100 text-ink;
+  }
+}

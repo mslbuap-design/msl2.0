@@ -1,0 +1,115 @@
+﻿services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: msl-postgres
+
+    environment:
+      POSTGRES_DB: msl_db
+      POSTGRES_USER: msl_user
+      POSTGRES_PASSWORD: msl_password
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U msl_user -d msl_db"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+    restart: unless-stopped
+
+    networks:
+      - msl-network
+
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+
+    container_name: msl-backend
+
+    environment:
+      MSL_SERVER_MODE: server
+      JULIA_NUM_THREADS: auto
+
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: msl_db
+      DB_USER: msl_user
+      DB_PASSWORD: msl_password
+
+      MSL_PROJECTS_DIR: /root/projects
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - ./projects:/root/projects
+      - ./output:/root/Resultados
+      - ./cache:/tmp/msl_process_cache
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "julia",
+          "--project=.",
+          "-e",
+          "using HTTP; r = HTTP.get(\"http://127.0.0.1:8000/api/test\"); exit(r.status == 200 ? 0 : 1)"
+        ]
+      interval: 15s
+      timeout: 10s
+      start_period: 90s
+      retries: 20
+
+    mem_limit: 4g
+    mem_reservation: 2g
+
+    restart: unless-stopped
+
+    networks:
+      - msl-network
+
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+
+    container_name: msl-frontend
+
+    ports:
+      - "3000:80"
+
+    # Sin variables de entorno: nginx sirve los estáticos del build de Vite,
+    # y el frontend detecta la URL del backend en tiempo de ejecución
+    # (mismo hostname, puerto 8000) desde el navegador — ver services/api.js.
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    networks:
+      - msl-network
+
+
+volumes:
+  postgres_data:
+
+
+networks:
+  msl-network:
+    driver: bridge

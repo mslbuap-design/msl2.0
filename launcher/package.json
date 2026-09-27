@@ -1,0 +1,17 @@
+{
+  "name": "msl-process-launcher",
+  "version": "1.0.0",
+  "description": "MSL Process - Unified Launcher",
+  "main": "launcher-desktop.js",
+  "scripts": {
+    "desktop": "node launcher-desktop.js",
+    "server": "node launcher-server.js"
+  },
+  "keywords": ["medical", "imaging", "radiomics"],
+  "author": "MSL Process Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "open": "^8.4.2"
+  }
+}

@@ -1,0 +1,16 @@
+﻿FROM julia:1.10
+
+WORKDIR /app/backend
+
+# Copiar entorno
+COPY backend/Project.toml ./
+
+# Instalar dependencias
+RUN julia -e 'using Pkg; Pkg.activate("."); Pkg.instantiate()'
+
+# Copiar código
+COPY backend/ ./
+
+EXPOSE 8000
+
+CMD ["julia", "-t", "auto", "--project=.", "server.jl"]
