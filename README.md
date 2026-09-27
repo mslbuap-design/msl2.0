@@ -155,4 +155,4 @@ frontend que le habla al backend) y en `backend/src/handlers/`.
 ## Documentación para desarrolladores
 
 Si te vas a unir al desarrollo de esta app (incluyendo el módulo de grafos),
-lee **[`docs/MANUAL_DESARROLLO.md`](docs/MANUAL_DESARROLLO.md)** 
+lee **MANUAL_DESARROLLO.md`** 
