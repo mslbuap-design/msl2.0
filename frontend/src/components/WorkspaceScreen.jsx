@@ -1,4 +1,4 @@
-import { CheckSquare, Square, Eye, FlaskConical, BarChart3 } from 'lucide-react';
+import { CheckSquare, Square, Eye, FlaskConical, BarChart3, Network } from 'lucide-react';
 import { useProjectContext } from '../context/ProjectContext.jsx';
 import { extractAllCompatibleFiles } from '../utils/fileTree.js';
 import WorkspaceHeader from './WorkspaceHeader.jsx';
@@ -7,18 +7,19 @@ import TabBar from './TabBar.jsx';
 import VisualizationTab from '../modules/visualization/VisualizationTab.jsx';
 import RadiomicsTab from '../modules/radiomics/RadiomicsTab.jsx';
 import StatisticsTab from '../modules/statistics/StatisticsTab.jsx';
+import GraphsTab from '../modules/graphs/GraphsTab.jsx';
 
 const TABS = [
   { id: 'visualization', label: 'Visualización', icon: Eye },
   { id: 'radiomics', label: 'Radiómica', icon: FlaskConical },
   { id: 'statistics', label: 'Estadísticas', icon: BarChart3 },
-  // Grafos: reservado — ver modules/graphs/. Se agrega aquí cuando se implemente.
+  { id: 'graphs', label: 'Grafos', icon: Network },
 ];
 
 export default function WorkspaceScreen() {
   const { structure, activeTab, changeTab, selectedFiles, selectAllCompatible } = useProjectContext();
 
-  const showSelectAll = (activeTab === 'radiomics' || activeTab === 'statistics') && structure;
+  const showSelectAll = ['radiomics', 'statistics', 'graphs'].includes(activeTab) && structure;
   const allCompatible = structure ? extractAllCompatibleFiles(structure, activeTab) : [];
   const allSelected = showSelectAll && selectedFiles.length === allCompatible.length && allCompatible.length > 0;
 
@@ -63,6 +64,9 @@ export default function WorkspaceScreen() {
             </div>
             <div className={activeTab === 'statistics' ? 'h-full min-h-0' : 'hidden'}>
               <StatisticsTab />
+            </div>
+            <div className={activeTab === 'graphs' ? 'h-full min-h-0' : 'hidden'}>
+              <GraphsTab />
             </div>
           </div>
         </main>

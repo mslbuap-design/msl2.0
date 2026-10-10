@@ -399,7 +399,7 @@ end
 
 Calcula (y crea si hace falta) la carpeta de resultados para un análisis:
 carpeta hermana `Resultados_<nombre>` con subcarpetas `radiomics/`,
-`imagenes/` y `estadisticas/`.
+`imagenes/`, `estadisticas/` y `grafos/`.
 
 Antes esto vivía en `server.jl` como `determinar_ruta_guardado()` y leía
 `PROYECTO_ACTUAL`, una variable global mutada por el último proyecto
@@ -420,6 +420,7 @@ function determinar_ruta_resultados(ruta_proyecto::AbstractString="", nombre_pro
         mkpath(joinpath(ruta_resultados, "radiomics"))
         mkpath(joinpath(ruta_resultados, "imagenes"))
         mkpath(joinpath(ruta_resultados, "estadisticas"))
+        mkpath(joinpath(ruta_resultados, "grafos"))
 
         println("📁 Ruta de resultados: $ruta_resultados")
         return ruta_resultados

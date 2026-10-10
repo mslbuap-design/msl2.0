@@ -12,3 +12,4 @@ projects/*
 !projects/.gitkeep
 notas/*
 cache/*
+docs/*

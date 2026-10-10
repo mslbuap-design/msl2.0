@@ -39,10 +39,11 @@ catch e
     println("   Instalar con: using Pkg; Pkg.add(\"NativeFileDialog\")")
 end
 
-# Módulos de dominio (procesamiento de imágenes, radiómica, estadística)
+# Módulos de dominio (procesamiento de imágenes, radiómica, estadística, grafos)
 include("ProcesamientoImagenes.jl")
 include("AnalisisRadiomico.jl")
 include("AnalisisEstadistico.jl")
+include("AnalisisGrafos.jl")
 
 # ==============================================================================
 # CONFIGURACIÓN GLOBAL
@@ -85,6 +86,7 @@ include(joinpath("src", "handlers", "archivos.jl"))
 include(joinpath("src", "handlers", "visualizacion.jl"))
 include(joinpath("src", "handlers", "radiomica.jl"))
 include(joinpath("src", "handlers", "estadistica.jl"))
+include(joinpath("src", "handlers", "grafos.jl"))
 
 # ==============================================================================
 # ROUTER PRINCIPAL

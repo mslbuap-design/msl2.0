@@ -247,6 +247,19 @@ export async function analisisEstadistico(payload) {
   return data;
 }
 
+// ============================================================================
+// GRAFOS
+// ============================================================================
+
+/**
+ * POST /api/analisis-grafos
+ * @param {{archivos: string[], tipo_grafo: 'vascular'|'conectividad', opciones?: {bbox?: number[], umbral_higado?: number}, ruta_proyecto?: string, async?: boolean}} payload
+ */
+export async function analisisGrafos(payload) {
+  const { data } = await client.post('/api/analisis-grafos', payload);
+  return data;
+}
+
 export default {
   API_BASE_URL,
   fileToBase64,
@@ -270,4 +283,5 @@ export default {
   guardarImagen,
   analisisRadiomico,
   analisisEstadistico,
+  analisisGrafos,
 };

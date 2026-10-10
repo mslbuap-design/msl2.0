@@ -23,7 +23,7 @@ export default function FolderTree({ node, level = 0 }) {
   } = useProjectContext();
 
   const [isExpanded, setIsExpanded] = useState(true);
-  const showCheckboxes = activeTab === 'radiomics' || activeTab === 'statistics';
+  const showCheckboxes = ['radiomics', 'statistics', 'graphs'].includes(activeTab);
 
   if (node.type === 'file') {
     const compatible = isCompatibleFile(node.name, activeTab);

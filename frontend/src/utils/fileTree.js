@@ -2,11 +2,13 @@
 
 /**
  * Determina si un archivo es compatible con el módulo activo.
- * Visualización y Radiómica: solo NIfTI/DICOM.
+ * Visualización, Radiómica y Grafos: solo NIfTI/DICOM (Grafos, fase
+ * vascular: volúmenes 3D estáticos — cuando se agregue conectividad
+ * temporal, esto seguirá siendo el mismo formato, solo 4D en vez de 3D).
  * Estadística: NIfTI/DICOM o Excel (para comparar hojas de datos).
  *
  * @param {string} filename
- * @param {'visualization'|'radiomics'|'statistics'} [tab]
+ * @param {'visualization'|'radiomics'|'statistics'|'graphs'} [tab]
  */
 export function isCompatibleFile(filename, tab = 'visualization') {
   const lowerName = filename.toLowerCase();
@@ -25,7 +27,7 @@ export function isCompatibleFile(filename, tab = 'visualization') {
  *
  * @param {File[]} fileList
  * @param {string} rootName
- * @param {'visualization'|'radiomics'|'statistics'} activeTab
+ * @param {'visualization'|'radiomics'|'statistics'|'graphs'} activeTab
  * @returns {FileNode}
  */
 export function buildTreeFromFiles(fileList, rootName, activeTab = 'visualization') {
@@ -77,7 +79,7 @@ export function findFirstCompatibleFile(node) {
 
 /**
  * @param {FileNode} node
- * @param {'visualization'|'radiomics'|'statistics'} activeTab
+ * @param {'visualization'|'radiomics'|'statistics'|'graphs'} activeTab
  * @returns {FileNode[]}
  */
 export function extractAllCompatibleFiles(node, activeTab = 'visualization') {
