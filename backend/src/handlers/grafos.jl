@@ -49,11 +49,21 @@ function handler_analisis_grafos(req, params)
             job, completados / total, "Archivo $completados de $total"
         )
 
-        result = analizar_grafos(rutas_completas, tipo_grafo, opciones; on_progreso=on_progreso)
+        # La carpeta de resultados se resuelve ANTES de analizar: el análisis guarda ahí el JSON
+        # de cada grafo (nodos y aristas), y después se escribe el Excel resumen en la misma carpeta.
+        ruta_resultados = nothing
+        try
+            ruta_resultados = determinar_ruta_resultados(ruta_proyecto)
+        catch e
+            println("⚠️  No se pudo preparar la carpeta de resultados: $e")
+        end
+        dir_salida = isnothing(ruta_resultados) ? nothing : joinpath(ruta_resultados, "grafos")
 
-        if result["success"]
+        result = analizar_grafos(rutas_completas, tipo_grafo, opciones; on_progreso=on_progreso, dir_salida=dir_salida,
+                                 registrar_resultado=GrafosCache.registrar!)
+
+        if result["success"] && !isnothing(ruta_resultados)
             try
-                ruta_resultados = determinar_ruta_resultados(ruta_proyecto)
                 ruta_excel = guardar_resultados_grafos_excel(result, ruta_resultados)
                 result["ruta_excel"] = ruta_excel
             catch e
@@ -81,4 +91,45 @@ function handler_analisis_grafos(req, params)
     return json_response(result["success"] ? 200 : 500, result)
 end
 
+# ------------------------------------------------------------------------
+# POST /api/grafos/corte
+# body: {resultado_id, orientacion: "axial"|"coronal"|"sagittal", indice (1-indexado),
+#        capas?: {mascara, esqueleto, nodos} (default true), grosor?: cortes vecinos a cada
+#        lado cuyo esqueleto/nodos se proyectan (default 0)}
+# Dibuja un corte del volumen analizado con las capas superpuestas, sin recalcular nada:
+# usa lo que dejó el análisis en `GrafosCache`.
+# ------------------------------------------------------------------------
+function handler_grafos_corte(req, params)
+    request_data = leer_body_json(req)
+    id = String(get(request_data, "resultado_id", ""))
+    orientacion = String(get(request_data, "orientacion", "axial"))
+    indice = round(Int, get(request_data, "indice", 1))
+    grosor = round(Int, get(request_data, "grosor", 0))
+    capas = get(request_data, "capas", Dict())
+
+    if !(orientacion in ("axial", "coronal", "sagittal"))
+        return error_response(400, "orientacion inválida: '$orientacion' (esperado axial, coronal o sagittal)")
+    end
+
+    datos = GrafosCache.obtener(id)
+    if isnothing(datos)
+        return error_response(404, "Resultado no disponible (se liberó de memoria): vuelve a ejecutar el análisis de este archivo")
+    end
+
+    png, total, idx = renderizar_corte_grafo(datos, orientacion, indice;
+        mostrar_mascara=Bool(get(capas, "mascara", true)),
+        mostrar_esqueleto=Bool(get(capas, "esqueleto", true)),
+        mostrar_nodos=Bool(get(capas, "nodos", true)),
+        grosor=grosor)
+
+    return json_response(200, Dict(
+        "success" => true,
+        "imagen" => png,
+        "orientacion" => orientacion,
+        "indice" => idx,
+        "total_cortes" => total,
+    ))
+end
+
 registrar_ruta!("POST", "/api/analisis-grafos", handler_analisis_grafos)
+registrar_ruta!("POST", "/api/grafos/corte", handler_grafos_corte)

@@ -1,29 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as api from '../../services/api.js';
 import { useProjectContext } from '../../context/ProjectContext.jsx';
 import { useNativeDialogs } from '../../hooks/useNativeDialogs.js';
 import { extractAllCompatibleFiles } from '../../utils/fileTree.js';
+import { PARAMS_POR_DEFECTO, construirOpciones } from './graphUtils.js';
 
 /**
  * Estado y lógica propios de Grafos. Mismo patrón que `useRadiomics`/
  * `useStatistics`: lee `structure`/`selectedFile(s)`/`project` del
  * `ProjectContext` y expone su propio estado, sin tocar los otros módulos.
  *
- * FASE 0: el backend (`AnalisisGrafos.jl`) todavía devuelve resultados de
- * prueba (placeholder), no un grafo real — ver docs/CAMBIOS_PARA_GRAFOS.md.
- * El objetivo de esta fase es dejar el flujo completo (este hook -> API ->
- * Jobs -> Excel) andando de punta a punta, para que implementar el
- * algoritmo real (Fase 1-3) no requiera tocar esta capa.
+ * Controles manuales: `params` (textos de los campos), `bbox` (recorte de
+ * región, Paso 0) y `opciones` (lo que realmente se envía al backend, derivado
+ * de los dos anteriores por `construirOpciones`: solo lo que difiere del
+ * default). `erroresParams` impide lanzar el análisis mientras haya algún
+ * campo inválido.
  *
- * `tipoGrafo` está fijo en `'vascular'` por ahora (única rama implementada
- * en el backend; `'conectividad'` responde 501). Cuando se implemente la
- * segunda rama, esto se vuelve una selección real en la UI — el resto del
- * flujo (llamada a la API, manejo de resultados) ya está preparado para
- * recibir cualquiera de los dos valores sin cambios.
- *
- * `opciones` (bbox/umbral de la delimitación hepática ajustable) va vacío
- * por ahora — todavía no existe la interacción de ajuste manual sobre los
- * cortes del visor. Cuando se agregue, alimenta este mismo campo.
+ * `tipoGrafo` está fijo en `'vascular'` por ahora (única rama implementada en
+ * el backend; `'conectividad'` responde 501). Cuando se implemente la segunda
+ * rama, esto se vuelve una selección real en la UI.
  */
 export function useGraphs() {
   const { activeTab, structure, selectedFile, selectedFiles, project } = useProjectContext();
@@ -34,6 +29,10 @@ export function useGraphs() {
   const [graphsRunning, setGraphsRunning] = useState(false);
   const [graphsResults, setGraphsResults] = useState(null);
   const [expandedResult, setExpandedResult] = useState(null);
+
+  const [params, setParams] = useState(PARAMS_POR_DEFECTO);
+  const [bbox, setBbox] = useState(null);
+  const [regionAbierta, setRegionAbierta] = useState(false);
 
   // Al activarse la pestaña, forzar modo múltiple (igual que en Radiómica).
   const wasActive = useRef(false);
@@ -51,20 +50,33 @@ export function useGraphs() {
       ? [selectedFile]
       : [];
 
+  const { opciones, errores: erroresParams } = useMemo(() => construirOpciones(params, bbox), [params, bbox]);
+
+  const setParam = useCallback((clave, valor) => {
+    setParams((previo) => ({ ...previo, [clave]: valor }));
+  }, []);
+
+  const restablecerParams = useCallback(() => setParams(PARAMS_POR_DEFECTO), []);
+
   const startGraphs = useCallback(async () => {
     if (filesToAnalyze.length === 0) {
       notify('No hay archivos seleccionados');
       return;
     }
+    if (erroresParams.length > 0) {
+      notify(`Revisa los parámetros:\n${erroresParams.join('\n')}`);
+      return;
+    }
 
     setGraphsRunning(true);
     setGraphsResults(null);
+    setExpandedResult(null);
 
     try {
       const result = await api.analisisGrafos({
         archivos: filesToAnalyze.map((f) => f.fullPath || f.name),
         tipo_grafo: tipoGrafo,
-        opciones: {},
+        opciones,
         ruta_proyecto: project?.ruta || '',
       });
 
@@ -81,7 +93,7 @@ export function useGraphs() {
       setGraphsRunning(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filesToAnalyze, tipoGrafo, project, notify]);
+  }, [filesToAnalyze, tipoGrafo, opciones, erroresParams, project, notify]);
 
   return {
     multipleFilesMode,
@@ -95,5 +107,14 @@ export function useGraphs() {
     startGraphs,
     structure,
     selectedFiles,
+    // controles manuales
+    params,
+    setParam,
+    restablecerParams,
+    erroresParams,
+    bbox,
+    setBbox,
+    regionAbierta,
+    setRegionAbierta,
   };
 }

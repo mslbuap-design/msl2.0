@@ -260,6 +260,15 @@ export async function analisisGrafos(payload) {
   return data;
 }
 
+/**
+ * POST /api/grafos/corte — corte de un resultado ya analizado, con capas superpuestas.
+ * @param {{resultado_id: string, orientacion: 'axial'|'coronal'|'sagittal', indice: number, capas?: {mascara?: boolean, esqueleto?: boolean, nodos?: boolean}, grosor?: number}} payload
+ */
+export async function grafosCorte(payload) {
+  const { data } = await client.post('/api/grafos/corte', payload);
+  return data;
+}
+
 export default {
   API_BASE_URL,
   fileToBase64,
@@ -284,4 +293,5 @@ export default {
   analisisRadiomico,
   analisisEstadistico,
   analisisGrafos,
+  grafosCorte,
 };

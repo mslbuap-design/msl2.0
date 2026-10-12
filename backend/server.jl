@@ -20,6 +20,7 @@ using Dates
 include(joinpath("src", "http_utils.jl"));   using .HttpUtils
 include(joinpath("src", "file_resolver.jl")); using .FileResolver
 include(joinpath("src", "image_cache.jl"));  using .ImagenesCache
+include(joinpath("src", "grafos_cache.jl"));  using .GrafosCache
 include(joinpath("src", "jobs.jl"));          using .Jobs
 include(joinpath("src", "router.jl"));        using .Router
 include(joinpath("src", "directory_scan.jl"))
@@ -43,7 +44,8 @@ end
 include("ProcesamientoImagenes.jl")
 include("AnalisisRadiomico.jl")
 include("AnalisisEstadistico.jl")
-include("AnalisisGrafos.jl")
+include("PreprocesamientoGrafos.jl")   # grafos: imagen -> máscara vascular (separado a propósito, cambia mucho)
+include("AnalisisGrafos.jl")           # grafos: máscara -> esqueleto -> grafo -> métricas
 
 # ==============================================================================
 # CONFIGURACIÓN GLOBAL

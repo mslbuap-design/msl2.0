@@ -124,6 +124,7 @@ function handler_limpiar_cache(req, params)
     try
         result = limpiar_cache()
         ImagenesCache.limpiar_imagenes!()
+        GrafosCache.limpiar_grafos!()
         result["loaded_images_cleared"] = true
         return json_response(200, result)
     catch e
