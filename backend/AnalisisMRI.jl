@@ -94,15 +94,15 @@ Crea una máscara binaria limpia del cuerpo/estructura eliminando
 el ruido del aire exterior.
 """
 function crear_mascara_tejido(volumen_normalizado, umbral=0.1)
-    # Binarización básica por umbral (vóxeles con señal vs fondo)
+    # Binarizacion basica por umbral (voxeles con seal vs fondo)
     mascara = volumen_normalizado .> umbral
     
-    # Operación de Clausura (Closing): Cierra pequeños agujeros dentro del tejido
-    # Usamos un cubo de conectividad estructural estándar
+    # Operacion de Clausura (Closing): Cierra pequeos agujeros dentro del tejido
+    # Usamos un cubo de conectividad estructural estandar
     mascara_limpia = closing(mascara)
     
-    # Operación de Apertura (Opening): Elimina islas de ruido flotando en el aire exterior
+    # Operacion de Apertura (Opening): Elimina islas de ruido flotando en el aire exterior
     mascara_limpia = opening(mascara_limpia)
-    
+   
     return mascara_limpia
 end
