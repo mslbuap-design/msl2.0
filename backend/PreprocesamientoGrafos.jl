@@ -29,10 +29,11 @@
 # Limitación conocida: NO hay aislamiento del hígado. El filtro de Frangi
 # responde a cualquier estructura brillante y alargada (vasos, pero también
 # médula ósea, bordes, etc.), así que sin delimitar el hígado la máscara
-# incluye cosas que no son vasos hepáticos. La verificación del filtro sobre
-# un tubo sintético da 100% de cobertura y 0% de falsos positivos
-# (`autoprueba_preprocesamiento`): el problema no es el filtro sino lo que se
-# le da a analizar. Ver docs/CAMBIOS_PARA_GRAFOS.md.
+# incluye cosas que no son vasos hepáticos. Sobre tubos sintéticos (vóxel
+# isotrópico y anisotrópico) el filtro da 100% de cobertura del eje y 0% de
+# falsos positivos (`autoprueba_preprocesamiento`): el problema no es el filtro
+# sino lo que se le da a analizar. Solo detecta estructuras BRILLANTES sobre
+# fondo oscuro. Ver docs/CAMBIOS_PARA_GRAFOS.md.
 #
 # Opciones que consume este archivo (todas opcionales, en `opciones`):
 #   "bbox"                  [x0,x1,y0,y1,z0,z1], 1-indexado inclusivo
@@ -146,9 +147,22 @@ end
 Las 6 componentes únicas de la matriz Hessiana 3×3 (simétrica) en cada
 vóxel, vía diferencias finitas centradas de 2º orden. Bordes replicados
 (`clamp`) en vez de asumir ceros fuera del volumen.
+
+Las derivadas se calculan en UNIDADES FÍSICAS (intensidad/mm²): cada
+diferencia se divide por el espaciado de vóxel (`h_i²` en las derivadas puras,
+`4·h_i·h_j` en las mixtas, donde el 4 es de la diferencia centrada). Es
+necesario cuando el vóxel es anisotrópico (p. ej. 1×1×3 mm): con diferencias en
+índices de vóxel la Hessiana real `H` se convierte en `D·H·D` con
+`D = diag(h)`, que no es un cambio de escala uniforme y deforma los cocientes
+de autovalores que usa Frangi (un tubo que corre en el plano, con sus dos
+direcciones transversales ponderadas 1 y 9, se leería como una placa). Con
+vóxeles isotrópicos de 1 mm el resultado es idéntico al anterior.
 """
-function _hessiana_3d(vol::Array{Float64,3})
+function _hessiana_3d(vol::Array{Float64,3}, voxel_dims)
     nx, ny, nz = size(vol)
+    sx, sy, sz = Float64(voxel_dims[1]), Float64(voxel_dims[2]), Float64(voxel_dims[3])
+    wxx = 1 / sx^2; wyy = 1 / sy^2; wzz = 1 / sz^2
+    wxy = 1 / (4 * sx * sy); wxz = 1 / (4 * sx * sz); wyz = 1 / (4 * sy * sz)
     Ixx = similar(vol); Iyy = similar(vol); Izz = similar(vol)
     Ixy = similar(vol); Ixz = similar(vol); Iyz = similar(vol)
 
@@ -160,13 +174,13 @@ function _hessiana_3d(vol::Array{Float64,3})
                 ip = clamp(i + 1, 1, nx); im = clamp(i - 1, 1, nx)
                 c = vol[i, j, k]
 
-                Ixx[i, j, k] = vol[ip, j, k] - 2c + vol[im, j, k]
-                Iyy[i, j, k] = vol[i, jp, k] - 2c + vol[i, jm, k]
-                Izz[i, j, k] = vol[i, j, kp] - 2c + vol[i, j, km]
+                Ixx[i, j, k] = (vol[ip, j, k] - 2c + vol[im, j, k]) * wxx
+                Iyy[i, j, k] = (vol[i, jp, k] - 2c + vol[i, jm, k]) * wyy
+                Izz[i, j, k] = (vol[i, j, kp] - 2c + vol[i, j, km]) * wzz
 
-                Ixy[i, j, k] = (vol[ip, jp, k] - vol[ip, jm, k] - vol[im, jp, k] + vol[im, jm, k]) / 4.0
-                Ixz[i, j, k] = (vol[ip, j, kp] - vol[ip, j, km] - vol[im, j, kp] + vol[im, j, km]) / 4.0
-                Iyz[i, j, k] = (vol[i, jp, kp] - vol[i, jp, km] - vol[i, jm, kp] + vol[i, jm, km]) / 4.0
+                Ixy[i, j, k] = (vol[ip, jp, k] - vol[ip, jm, k] - vol[im, jp, k] + vol[im, jm, k]) * wxy
+                Ixz[i, j, k] = (vol[ip, j, kp] - vol[ip, j, km] - vol[im, j, kp] + vol[im, j, km]) * wxz
+                Iyz[i, j, k] = (vol[i, jp, kp] - vol[i, jp, km] - vol[i, jm, kp] + vol[i, jm, km]) * wyz
             end
         end
     end
@@ -232,11 +246,13 @@ function _frangi_una_escala(vol::Array{Float64,3}, voxel_dims, sigma_mm::Float64
                              alpha::Float64, beta::Float64, c_override::Union{Float64,Nothing})
     sx, sy, sz = voxel_dims
     suavizado = suavizar_gaussiano_3d(vol, sigma_mm / sx, sigma_mm / sy, sigma_mm / sz)
-    Ixx, Iyy, Izz, Ixy, Ixz, Iyz = _hessiana_3d(suavizado)
+    Ixx, Iyy, Izz, Ixy, Ixz, Iyz = _hessiana_3d(suavizado, voxel_dims)
 
     # Normalización de escala (Lindeberg, γ=2): sin esto, un σ más grande
     # da respuestas sistemáticamente más chicas aunque el vaso de ese
     # calibre sí esté presente — esto iguala la comparación entre escalas.
+    # Con la Hessiana en intensidad/mm², σ² la deja en unidades de intensidad
+    # (las mismas de `c` manual y de la "fuerza de estructura" S).
     factor = sigma_mm^2
     nx, ny, nz = size(vol)
 
@@ -630,6 +646,28 @@ function autoprueba_preprocesamiento()
     end
     ok &= chequear("Frangi + Otsu: cobertura del eje del tubo $(round(100 * en_eje / n_eje; digits=1))% (>= 95%)", en_eje / n_eje >= 0.95)
     ok &= chequear("Frangi + Otsu: falsos positivos lejos del tubo $(round(100 * en_lejos / n_lejos; digits=2))% (<= 1%)", en_lejos / n_lejos <= 0.01)
+
+    # 6) Vóxel anisotrópico (1,1,3) mm: un tubo que corre en el plano y otro entre cortes, ambos de
+    #    radio 3 mm, deben dar una respuesta alta. Con la Hessiana en índices de vóxel el del plano
+    #    llegaba a ~0.06 (y el otro a ~0.11); con la Hessiana en mm: ~0.48 y ~0.75.
+    forma_a = (36, 36, 24)
+    dims_a = (1.0, 1.0, 3.0)
+    vol_a = zeros(Float64, forma_a...)
+    dist_a = zeros(Float64, forma_a...)      # distancia al eje del tubo A (a lo largo de x, en el plano)
+    dist_b = zeros(Float64, forma_a...)      # distancia al eje del tubo B (a lo largo de z, entre cortes)
+    for k in 1:forma_a[3], j in 1:forma_a[2], i in 1:forma_a[1]
+        px = (i - 1) * dims_a[1]; py = (j - 1) * dims_a[2]; pz = (k - 1) * dims_a[3]
+        da = sqrt((py - 9.0)^2 + (pz - 34.5)^2)
+        db = sqrt((px - 26.0)^2 + (py - 26.0)^2)
+        dist_a[i, j, k] = da
+        dist_b[i, j, k] = db
+        (da <= 3.0 || db <= 3.0) && (vol_a[i, j, k] = 1.0)
+    end
+    va = calcular_vesselness(vol_a, dims_a)
+    vmax_a = maximum(va[dist_a .<= 1.6])
+    vmax_b = maximum(va[dist_b .<= 1.6])
+    ok &= chequear("vóxel anisotrópico: vesselness del tubo en el plano $(round(vmax_a; digits=3)) y entre cortes $(round(vmax_b; digits=3)) (ambos >= 0.3)",
+                   vmax_a >= 0.3 && vmax_b >= 0.3)
 
     println(ok ? "✅ Autoprueba del preprocesamiento: todo en orden" : "❌ Autoprueba del preprocesamiento: HAY FALLOS")
     return ok
