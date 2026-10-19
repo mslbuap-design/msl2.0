@@ -127,6 +127,9 @@ export default function ControlesGrafos({
         <Campo etiqueta="Ventana de suavizado" ayuda="Semiventana (en vóxeles de camino) del suavizado de la línea central antes de medir longitudes (default 2).">
           <Texto etiqueta="Ventana de suavizado" valor={params.ventana} onCambio={(v) => setParam('ventana', v)} />
         </Campo>
+        <Campo etiqueta="Longitud mín. para tortuosidad (mm)" ayuda="Las aristas más cortas que esto no entran en los estadísticos de tortuosidad: un tramo de pocos vóxeles da un cociente arco/cuerda ruidoso (default 5).">
+          <Texto etiqueta="Longitud mín. para tortuosidad (mm)" valor={params.longTortuosidad} onCambio={(v) => setParam('longTortuosidad', v)} />
+        </Campo>
       </Seccion>
 
       {errores.length > 0 && (

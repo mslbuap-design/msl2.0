@@ -13,14 +13,14 @@ import * as U from './graphUtils.js';
 let r = U.construirOpciones(U.PARAMS_POR_DEFECTO, null);
 assert.deepEqual(r.opciones, {}); assert.deepEqual(r.errores, []);
 r = U.construirOpciones({ ...U.PARAMS_POR_DEFECTO, escalas: '1.5, 3', umbralAuto: false, umbral: '0,02', minVoxeles: '250',
-  rellenarCavidades: false, longMinRama: '4', ventana: '3', cAuto: false, c: '0.8' }, [1, 100, 5, 90, 2, 30]);
+  rellenarCavidades: false, longMinRama: '4', ventana: '3', cAuto: false, c: '0.8', longTortuosidad: '8' }, [1, 100, 5, 90, 2, 30]);
 assert.deepEqual(r.opciones, { bbox: [1, 100, 5, 90, 2, 30], escalas_mm: [1.5, 3], c: 0.8, umbral_vesselness: 0.02,
-  min_voxeles_componente: 250, rellenar_cavidades: false, longitud_min_rama_mm: 4, ventana_suavizado: 3 });
-r = U.construirOpciones({ ...U.PARAMS_POR_DEFECTO, escalas: '1 2 3', alpha: '0,5', longMinRama: '3.0' }, null);
+  min_voxeles_componente: 250, rellenar_cavidades: false, longitud_min_rama_mm: 4, ventana_suavizado: 3, longitud_min_tortuosidad_mm: 8 });
+r = U.construirOpciones({ ...U.PARAMS_POR_DEFECTO, escalas: '1 2 3', alpha: '0,5', longMinRama: '3.0', longTortuosidad: '5.0' }, null);
 assert.deepEqual(r.opciones, {});
 r = U.construirOpciones({ ...U.PARAMS_POR_DEFECTO, escalas: '', alpha: '0', beta: 'abc', cAuto: false, c: '',
-  umbralAuto: false, umbral: '-1', minVoxeles: '2.5', longMinRama: '-3', factorRadio: 'x', ventana: '20' }, null);
-assert.equal(r.errores.length, 9, r.errores.join(' | '));
+  umbralAuto: false, umbral: '-1', minVoxeles: '2.5', longMinRama: '-3', factorRadio: 'x', ventana: '20', longTortuosidad: '-1' }, null);
+assert.equal(r.errores.length, 10, r.errores.join(' | '));
 assert.equal(U.parseEscalas('0.05'), null); assert.equal(U.parseEscalas('25'), null); assert.deepEqual(U.parseEscalas('1,2;3 4'), [1,2,3,4]);
 const rotr90 = (A) => { const p = A.length, q = A[0].length; return Array.from({ length: q }, (_, r) => Array.from({ length: p }, (_, c) => A[p - 1 - c][r])); };
 const flipRows = (A) => [...A].reverse();

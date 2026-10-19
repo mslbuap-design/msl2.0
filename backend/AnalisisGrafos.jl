@@ -35,6 +35,8 @@
 #                           gruesa de su bifurcación, lo que sea mayor (default 1.5)
 #   "ventana_suavizado"     semiventana (en vóxeles de camino) del suavizado de
 #                           la línea central antes de medir su longitud (default 2)
+#   "longitud_min_tortuosidad_mm"  las aristas más cortas que esto no entran en los
+#                           estadísticos de tortuosidad (default 5.0); ver MetricasGrafos.jl
 # ==============================================================================
 
 using Dates
@@ -279,6 +281,47 @@ struct _ArcoGrafo
     longitud::Float64     # mm, a lo largo de la línea central (suavizada)
     rad_long::Float64     # suma de (radio local × longitud): para promediar radios ponderando por longitud
     n_vox::Int
+    dir_u::NTuple{3,Float64}   # vector unitario (mm) con el que la arista SALE del extremo u (para ángulos de bifurcación)
+    dir_v::NTuple{3,Float64}   # ídem en el extremo v
+end
+
+"""
+Vector unitario con el que una arista SALE de uno de sus extremos, medido entre
+las distancias `ka·rad` y `kb·rad` (a lo largo de la línea) desde ese extremo:
+`P(kb·rad) − P(ka·rad)`. Se mide lejos del nodo a propósito: cerca de la unión
+de dos tubos gruesos el esqueleto se curva, y la dirección "al salir" sesga el
+ángulo (en un Y de 56,9° la ventana 0–2 radios daba 73,9°; la de 3–6 da 56,9°).
+Si la arista es corta, la ventana se acota a `[L/3, L]`. `pts` es la polilínea
+3×n (del extremo u al v); `desde_inicio=false` mide desde el extremo v.
+"""
+function _direccion_extremo(pts::Matrix{Float64}, desde_inicio::Bool, rad::Float64; ka::Float64=3.0, kb::Float64=6.0)
+    n = size(pts, 2)
+    idx = desde_inicio ? collect(1:n) : collect(n:-1:1)
+    seg = Float64[sqrt((pts[1, idx[i+1]] - pts[1, idx[i]])^2 + (pts[2, idx[i+1]] - pts[2, idx[i]])^2 +
+                       (pts[3, idx[i+1]] - pts[3, idx[i]])^2) for i in 1:n-1]
+    L = sum(seg)
+    a = min(ka * rad, L / 3)
+    b = min(kb * rad, L)
+    punto = function (s)
+        acum = 0.0
+        for i in 1:n-1
+            sl = seg[i]
+            if acum + sl >= s && sl > 0
+                f = (s - acum) / sl
+                return (pts[1, idx[i]] + f * (pts[1, idx[i+1]] - pts[1, idx[i]]),
+                        pts[2, idx[i]] + f * (pts[2, idx[i+1]] - pts[2, idx[i]]),
+                        pts[3, idx[i]] + f * (pts[3, idx[i+1]] - pts[3, idx[i]]))
+            end
+            acum += sl
+        end
+        return (pts[1, idx[n]], pts[2, idx[n]], pts[3, idx[n]])
+    end
+    pa = punto(a)
+    pb = punto(b)
+    vx = pb[1] - pa[1]; vy = pb[2] - pa[2]; vz = pb[3] - pa[3]
+    nrm = sqrt(vx^2 + vy^2 + vz^2)
+    nrm > 1e-12 || return (NaN, NaN, NaN)
+    return (vx / nrm, vy / nrm, vz / nrm)
 end
 
 """Media móvil sobre una polilínea 3×n (extremos fijos). Quita el "dentado" de
@@ -436,7 +479,8 @@ function _construir_grafo(esq::Array{Bool,3}, dt::Array{Float64,3}, voxel_dims; 
                 for t in 1:npts-1
                     L += sqrt((pts[1, t+1] - pts[1, t])^2 + (pts[2, t+1] - pts[2, t])^2 + (pts[3, t+1] - pts[3, t])^2)
                 end
-                push!(aristas, _ArcoGrafo(cid, fin, L, rad * L, n_c))
+                push!(aristas, _ArcoGrafo(cid, fin, L, rad * L, n_c,
+                                          _direccion_extremo(pts, true, rad), _direccion_extremo(pts, false, rad)))
             end
         end
     end
@@ -504,7 +548,9 @@ function _podar_y_fusionar(aristas::Vector{_ArcoGrafo}, nn::Int, min_len::Float6
             a1 = ar[e1]; a2 = ar[e2]
             o1 = a1.u == nodo ? a1.v : a1.u
             o2 = a2.u == nodo ? a2.v : a2.u
-            push!(ar, _ArcoGrafo(o1, o2, a1.longitud + a2.longitud, a1.rad_long + a2.rad_long, a1.n_vox + a2.n_vox))
+            d1 = a1.u == nodo ? a1.dir_v : a1.dir_u      # dirección de a1 en su extremo o1
+            d2 = a2.u == nodo ? a2.dir_v : a2.dir_u      # dirección de a2 en su extremo o2
+            push!(ar, _ArcoGrafo(o1, o2, a1.longitud + a2.longitud, a1.rad_long + a2.rad_long, a1.n_vox + a2.n_vox, d1, d2))
             push!(vivas, true)
             nuevo = length(ar)
             push!(inc[o1], nuevo)
@@ -563,6 +609,8 @@ function _resumir_grafo(aristas::Vector{_ArcoGrafo}, deg::Vector{Int}, pos_mm::M
             "radio_medio_mm" => a.longitud > 0 ? _fin(a.rad_long / a.longitud) : nothing,
             "tortuosidad" => t === nothing ? nothing : _fin(t),
             "n_voxeles" => a.n_vox,
+            "dir_u" => [_fin(a.dir_u[1]), _fin(a.dir_u[2]), _fin(a.dir_u[3])],
+            "dir_v" => [_fin(a.dir_v[1]), _fin(a.dir_v[2]), _fin(a.dir_v[3])],
         ))
     end
 
@@ -802,10 +850,20 @@ function _analizar_grafo_vascular(archivo::AbstractString, opciones, dir_salida,
         ventana = Int(get(opciones, "ventana_suavizado", 2))
         grafo, esq = _grafo_de_mascara(mascara, voxel_dims; min_len=min_len, factor_radio=factor_radio, ventana=ventana)
 
+        # Métricas avanzadas (MetricasGrafos.jl): distribuciones, jerarquía, bifurcaciones, caminos.
+        long_min_tort = Float64(get(opciones, "longitud_min_tortuosidad_mm", 5.0))
+        avanzadas = calcular_metricas_avanzadas(grafo; longitud_min_tortuosidad_mm=long_min_tort)
+
+        # El grupo es la carpeta que contiene al archivo (la convención del proyecto: Proyecto/Grupo/archivo);
+        # queda guardado para poder comparar grupos después.
+        ruta_origen = abspath(archivo)
+        grupo = basename(dirname(ruta_origen))
+
         parametros = Dict{String,Any}(
             "longitud_min_rama_mm" => min_len,
             "factor_radio_poda" => factor_radio,
             "ventana_suavizado" => ventana,
+            "longitud_min_tortuosidad_mm" => long_min_tort,
         )
 
         # El grafo completo (nodos y aristas) se guarda aparte: es el insumo de la Fase 3 y de
@@ -821,11 +879,14 @@ function _analizar_grafo_vascular(archivo::AbstractString, opciones, dir_salida,
                 open(ruta_json, "w") do io
                     JSON3.write(io, Dict{String,Any}(
                         "archivo" => nombre_archivo,
+                        "ruta_origen" => ruta_origen,
+                        "grupo" => grupo,
                         "voxel_dims_mm" => pre["voxel_dims_mm"],
                         "region" => pre["region"],
                         "preprocesamiento" => pre["deteccion_vascular"],
                         "parametros_grafo" => parametros,
                         "grafo" => grafo,
+                        "avanzadas" => avanzadas,
                     ))
                 end
             catch e
@@ -852,6 +913,8 @@ function _analizar_grafo_vascular(archivo::AbstractString, opciones, dir_salida,
         return Dict(
             "archivo" => nombre_archivo,
             "success" => true,
+            "grupo" => grupo,
+            "ruta_origen" => ruta_origen,
             "resultado_id" => resultado_id,
             "dimensiones" => collect(size(mascara)),
             "voxel_dims_mm" => pre["voxel_dims_mm"],
@@ -863,6 +926,7 @@ function _analizar_grafo_vascular(archivo::AbstractString, opciones, dir_salida,
                 "parametros" => parametros,
                 "ruta_json" => ruta_json,
             ),
+            "avanzadas" => avanzadas,
             "visualizacion" => Dict(
                 "proyeccion_esqueleto_png" => _proyeccion_esqueleto_png(mascara, esq, grafo["nodos"]),
             ),
@@ -946,7 +1010,8 @@ function guardar_resultados_grafos_excel(result::Dict, base_resultados::String)
         encabezados = ["Archivo", "Estado", "Vóxeles vasculares", "Fracción de volumen",
                        "Nodos", "Bifurcaciones", "Puntas", "Aristas", "Longitud total (mm)",
                        "Radio promedio (mm)", "Tortuosidad promedio", "Componentes", "Ciclos independientes",
-                       "Umbral vesselness", "Región", "Archivo del grafo (JSON)", "Nota / error"]
+                       "Umbral vesselness", "Región", "Archivo del grafo (JSON)", "Nota / error", "Grupo"]
+        append!(encabezados, ORDEN_CARACTERISTICAS_GRAFOS)      # MetricasGrafos.jl: una columna por característica
         for (col, encabezado) in enumerate(encabezados)
             sheet[XLSX.CellRef(1, col)] = encabezado
         end
@@ -973,7 +1038,12 @@ function guardar_resultados_grafos_excel(result::Dict, base_resultados::String)
                 get(get(r, "region", Dict()), "origen", ""),
                 something(get(get(r, "grafo", Dict()), "ruta_json", nothing), ""),
                 get(r, "fase_pipeline", get(r, "error", "")),
+                get(r, "grupo", ""),
             ]
+            car = get(get(r, "avanzadas", Dict()), "caracteristicas", Dict())
+            for k in ORDEN_CARACTERISTICAS_GRAFOS
+                push!(valores, get(car, k, nothing))
+            end
             for (col, valor) in enumerate(valores)
                 sheet[XLSX.CellRef(fila, col)] = valor === nothing ? "" : valor
             end
@@ -1059,6 +1129,20 @@ function autoprueba_grafos()
     m = g["metricas"]
     ok &= chequear("Y con espinas: tras la poda, otra vez 4 nodos, 1 bifurcación, 3 puntas, 3 aristas",
                    (m["num_nodos"], m["num_bifurcaciones"], m["num_puntas"], m["num_aristas"]) == (4, 1, 3, 3))
+
+    # 3b) Direcciones de rama → ángulo entre las ramas del Y (real por construcción: 2·atan(13/24) = 56.9°).
+    #     Necesita MetricasGrafos.jl (si se corre este archivo suelto, se omite).
+    if isdefined(Main, :calcular_metricas_avanzadas)
+        gy, _ = _grafo_de_mascara(y, dims1)
+        My = Base.invokelatest(calcular_metricas_avanzadas, gy)
+        ang = My["estructura"]["bifurcaciones"]["angulo_hijas"]["media"]
+        ok &= chequear("Y: 1 bifurcación binaria y Strahler 2",
+                       My["estructura"]["bifurcaciones"]["n_binarias"] == 1 && My["estructura"]["jerarquia"]["strahler_max"] == 2)
+        ok &= chequear("Y: ángulo entre ramas ≈ 56.9° (medido: $(ang))",
+                       ang !== nothing && abs(ang - 2 * rad2deg(atan(13 / 24))) <= 4.0)
+    else
+        println("  ⚠️  (omitido el ángulo entre ramas: carga también MetricasGrafos.jl)")
+    end
 
     # 4) Y con vóxel anisotrópico (1,1,2): las longitudes en mm crecen con el espaciado en z.
     ga, _ = _grafo_de_mascara(y, (1.0, 1.0, 2.0))

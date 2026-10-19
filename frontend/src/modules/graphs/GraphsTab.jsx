@@ -3,6 +3,7 @@ import Button from '../../components/ui/Button.jsx';
 import EmptyState from '../../components/ui/EmptyState.jsx';
 import { extractAllCompatibleFiles } from '../../utils/fileTree.js';
 import ControlesGrafos from './ControlesGrafos.jsx';
+import MetricasAvanzadas from './MetricasAvanzadas.jsx';
 import RegionModal from './RegionModal.jsx';
 import VisorCortes from './VisorCortes.jsx';
 import { useGraphs } from './useGraphs.js';
@@ -204,6 +205,13 @@ function ResultRow({ result, isExpanded, onToggle }) {
                   <p className="text-xs text-faint mt-2 break-all">Grafo completo (nodos y aristas): {result.grafo.ruta_json}</p>
                 )}
               </div>
+
+              {result.avanzadas && (
+                <div>
+                  <p className="text-xs font-medium text-muted mb-2">Métricas avanzadas</p>
+                  <MetricasAvanzadas avanzadas={result.avanzadas} />
+                </div>
+              )}
 
               <div>
                 <p className="text-xs font-medium text-muted mb-2">Preprocesamiento</p>

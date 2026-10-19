@@ -27,6 +27,7 @@ export const PARAMS_POR_DEFECTO = {
   longMinRama: '3',
   factorRadio: '1.5',
   ventana: '2',
+  longTortuosidad: '5',
 };
 
 const DEFECTOS_NUM = {
@@ -37,6 +38,7 @@ const DEFECTOS_NUM = {
   longMinRama: 3,
   factorRadio: 1.5,
   ventana: 2,
+  longTortuosidad: 5,
 };
 
 /** Número desde texto (acepta coma decimal); NaN si está vacío o no es número. */
@@ -123,6 +125,10 @@ export function construirOpciones(params, bbox) {
   const ventana = aNumero(params.ventana);
   if (!Number.isInteger(ventana) || ventana < 0 || ventana > 10) errores.push('Ventana de suavizado debe ser un entero entre 0 y 10.');
   else if (ventana !== DEFECTOS_NUM.ventana) opciones.ventana_suavizado = ventana;
+
+  const longTort = aNumero(params.longTortuosidad);
+  if (!(longTort >= 0)) errores.push('Longitud mín. para tortuosidad debe ser un número ≥ 0 (mm).');
+  else if (longTort !== DEFECTOS_NUM.longTortuosidad) opciones.longitud_min_tortuosidad_mm = longTort;
 
   return { opciones, errores };
 }
