@@ -269,6 +269,16 @@ export async function grafosCorte(payload) {
   return data;
 }
 
+/**
+ * POST /api/grafos/exportar — exporta los datos de los grafos analizados a CSV (una tabla) o Excel (todas).
+ * Devuelve el archivo en Base64 (`contenido_base64`) además de guardarlo en Resultados_<proyecto>/grafos/.
+ * @param {{rutas_json: string[], formato: 'csv'|'xlsx', tabla?: 'sujetos'|'aristas'|'nodos', ruta_proyecto?: string}} payload
+ */
+export async function grafosExportar(payload) {
+  const { data } = await client.post('/api/grafos/exportar', payload);
+  return data;
+}
+
 export default {
   API_BASE_URL,
   fileToBase64,
@@ -294,4 +304,5 @@ export default {
   analisisEstadistico,
   analisisGrafos,
   grafosCorte,
+  grafosExportar,
 };

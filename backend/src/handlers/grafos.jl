@@ -132,4 +132,40 @@ function handler_grafos_corte(req, params)
 end
 
 registrar_ruta!("POST", "/api/analisis-grafos", handler_analisis_grafos)
+# ------------------------------------------------------------------------
+# POST /api/grafos/exportar
+# body: {rutas_json: [ruta del grafo_*.json de cada sujeto], formato: "csv"|"xlsx",
+#        tabla?: "sujetos"|"aristas"|"nodos" (solo CSV), ruta_proyecto}
+# Convierte los datos guardados del análisis en una tabla CSV o en un Excel con una hoja
+# por tabla; lo deja en Resultados_<proyecto>/grafos/ y devuelve el contenido en Base64
+# para que el navegador lo descargue. Solo lee los grafo_*.json que escribe el análisis.
+# ------------------------------------------------------------------------
+function handler_grafos_exportar(req, params)
+    request_data = leer_body_json(req)
+    rutas = String[String(r) for r in get(request_data, "rutas_json", String[])]
+    formato = String(get(request_data, "formato", "xlsx"))
+    tabla = String(get(request_data, "tabla", "sujetos"))
+    ruta_proyecto = String(get(request_data, "ruta_proyecto", ""))
+
+    if isempty(rutas)
+        return error_response(400, "No hay grafos para exportar: ejecuta primero el análisis")
+    end
+    if !(formato in ("csv", "xlsx"))
+        return error_response(400, "formato inválido: '$formato' (esperado csv o xlsx)")
+    end
+    if !(tabla in ("sujetos", "aristas", "nodos"))
+        return error_response(400, "tabla inválida: '$tabla' (esperado sujetos, aristas o nodos)")
+    end
+
+    try
+        ruta_resultados = determinar_ruta_resultados(ruta_proyecto)
+        resultado = exportar_grafos(rutas, formato, tabla, joinpath(ruta_resultados, "grafos"))
+        return json_response(200, resultado)
+    catch e
+        println("❌ Error exportando grafos: ", e)
+        return error_response(500, string(e))
+    end
+end
+
 registrar_ruta!("POST", "/api/grafos/corte", handler_grafos_corte)
+registrar_ruta!("POST", "/api/grafos/exportar", handler_grafos_exportar)

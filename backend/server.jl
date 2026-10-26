@@ -46,6 +46,7 @@ include("AnalisisRadiomico.jl")
 include("AnalisisEstadistico.jl")
 include("PreprocesamientoGrafos.jl")   # grafos: imagen -> máscara vascular (separado a propósito, cambia mucho)
 include("MetricasGrafos.jl")          # grafos: métricas avanzadas de un grafo (jerarquía, bifurcaciones, caminos)
+include("ExportacionGrafos.jl")        # grafos: exportar tablas (sujetos, aristas, nodos) a CSV / Excel
 include("AnalisisGrafos.jl")           # grafos: máscara -> esqueleto -> grafo -> métricas
 
 # ==============================================================================

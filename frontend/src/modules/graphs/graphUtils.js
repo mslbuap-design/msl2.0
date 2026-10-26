@@ -242,3 +242,27 @@ export function bboxDesdeArrastre(orientacion, dims, bbox, ini, fin) {
   nuevo[2 * IDX_EJE[v] + 1] = Math.max(v0, v1);
   return nuevo;
 }
+
+// ============================================================================
+// DESCARGA DE ARCHIVOS
+// ============================================================================
+
+/** Contenido Base64 -> Blob (bytes exactos, sirve para texto y binarios como .xlsx). */
+export function base64ABlob(base64, mime = 'application/octet-stream') {
+  const binario = atob(base64);
+  const bytes = new Uint8Array(binario.length);
+  for (let i = 0; i < binario.length; i += 1) bytes[i] = binario.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+/** Dispara la descarga en el navegador de un archivo recibido en Base64. */
+export function descargarArchivo(nombre, mime, base64) {
+  const url = URL.createObjectURL(base64ABlob(base64, mime));
+  const enlace = document.createElement('a');
+  enlace.href = url;
+  enlace.download = nombre;
+  document.body.appendChild(enlace);
+  enlace.click();
+  document.body.removeChild(enlace);
+  URL.revokeObjectURL(url);
+}

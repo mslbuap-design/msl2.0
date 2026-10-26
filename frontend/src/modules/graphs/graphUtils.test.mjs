@@ -61,4 +61,11 @@ for (let t = 0; t < 200; t += 1) {
 assert.deepEqual(U.normalizarBbox([50, 10, 0, 999, 3.4, 3.6], [40, 60, 20]), [10, 40, 1, 60, 3, 4]);
 assert.equal(U.totalCortes('sagittal', [10, 20, 30]), 10); assert.equal(U.totalCortes('coronal', [10, 20, 30]), 20); assert.equal(U.totalCortes('axial', [10, 20, 30]), 30);
 assert.ok(Math.abs(U.aspectoVista('coronal', [100, 100, 50], [1, 1, 3]) - (100 / 150)) < 1e-12);
+// ---- descarga: Base64 -> Blob con los bytes exactos (texto con acentos y binario) ----
+const txt = 'a,b\n1,ñ\n';
+const blobTxt = U.base64ABlob(Buffer.from(txt, 'utf8').toString('base64'), 'text/csv');
+assert.equal(blobTxt.type, 'text/csv'); assert.equal(await blobTxt.text(), txt);
+const bin = Buffer.from([0, 255, 128, 10, 13]);
+const blobBin = U.base64ABlob(bin.toString('base64'));
+assert.deepEqual(new Uint8Array(await blobBin.arrayBuffer()), new Uint8Array(bin));
 console.log(`graphUtils: todo OK (${casos} casos de geometría contra simulación de extract_slice)`);

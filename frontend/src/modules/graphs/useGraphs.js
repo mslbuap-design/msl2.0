@@ -3,7 +3,7 @@ import * as api from '../../services/api.js';
 import { useProjectContext } from '../../context/ProjectContext.jsx';
 import { useNativeDialogs } from '../../hooks/useNativeDialogs.js';
 import { extractAllCompatibleFiles } from '../../utils/fileTree.js';
-import { PARAMS_POR_DEFECTO, construirOpciones } from './graphUtils.js';
+import { PARAMS_POR_DEFECTO, construirOpciones, descargarArchivo } from './graphUtils.js';
 
 /**
  * Estado y lógica propios de Grafos. Mismo patrón que `useRadiomics`/
@@ -33,6 +33,7 @@ export function useGraphs() {
   const [params, setParams] = useState(PARAMS_POR_DEFECTO);
   const [bbox, setBbox] = useState(null);
   const [regionAbierta, setRegionAbierta] = useState(false);
+  const [exportando, setExportando] = useState(false);
 
   // Al activarse la pestaña, forzar modo múltiple (igual que en Radiómica).
   const wasActive = useRef(false);
@@ -95,6 +96,37 @@ export function useGraphs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filesToAnalyze, tipoGrafo, opciones, erroresParams, project, notify]);
 
+  /**
+   * Exporta los datos de los grafos analizados: "xlsx" (todas las tablas en un libro) o "csv" (una
+   * tabla: sujetos, aristas o nodos). El backend los lee de los JSON que guardó el análisis y los
+   * devuelve en Base64; acá se dispara la descarga.
+   */
+  const exportar = useCallback(
+    async (formato, tabla = 'sujetos') => {
+      const rutas = (graphsResults || []).filter((r) => r.success && r.grafo?.ruta_json).map((r) => r.grafo.ruta_json);
+      if (rutas.length === 0) {
+        notify('No hay resultados para exportar');
+        return;
+      }
+      setExportando(true);
+      try {
+        const res = await api.grafosExportar({ rutas_json: rutas, formato, tabla, ruta_proyecto: project?.ruta || '' });
+        if (res.success) {
+          descargarArchivo(res.nombre, res.mime, res.contenido_base64);
+          if (res.omitidos?.length) notify(`Se omitieron ${res.omitidos.length} grafo(s) que no se pudieron leer`);
+        } else {
+          notify(`❌ Error: ${res.error}`);
+        }
+      } catch (error) {
+        console.error('Error:', error);
+        notify('Error de conexión al exportar');
+      } finally {
+        setExportando(false);
+      }
+    },
+    [graphsResults, project, notify],
+  );
+
   return {
     multipleFilesMode,
     setMultipleFilesMode,
@@ -116,5 +148,7 @@ export function useGraphs() {
     setBbox,
     regionAbierta,
     setRegionAbierta,
+    exportando,
+    exportar,
   };
 }

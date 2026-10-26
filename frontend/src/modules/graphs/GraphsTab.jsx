@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronDown, ChevronRight, Network, XCircle } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, Download, Network, XCircle } from 'lucide-react';
 import Button from '../../components/ui/Button.jsx';
 import EmptyState from '../../components/ui/EmptyState.jsx';
 import { extractAllCompatibleFiles } from '../../utils/fileTree.js';
@@ -14,6 +14,21 @@ function MarcaFase({ texto = 'Fase 2' }) {
     <span className="inline-block px-2 py-0.5 text-xs font-medium rounded bg-amber-50 border border-amber-200 text-amber-800">
       {texto}
     </span>
+  );
+}
+
+/** Botón pequeño de exportación. */
+function BotonExportar({ onClick, disabled, titulo, children }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={titulo}
+      className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded border border-line bg-surface text-ink hover:bg-accent-50 disabled:opacity-50 disabled:cursor-not-allowed"
+    >
+      <Download size={12} />
+      {children}
+    </button>
   );
 }
 
@@ -42,6 +57,8 @@ export default function GraphsTab() {
     setBbox,
     regionAbierta,
     setRegionAbierta,
+    exportando,
+    exportar,
   } = useGraphs();
 
   const allCompatibleCount = structure ? extractAllCompatibleFiles(structure, 'graphs').length : 0;
@@ -105,7 +122,24 @@ export default function GraphsTab() {
       <div className="flex-1 min-h-0 flex flex-col min-w-0">
         {graphsResults ? (
           <>
-            <h3 className="text-base font-semibold text-ink mb-3">Resultados</h3>
+            <div className="flex items-center justify-between gap-2 flex-wrap mb-3">
+              <h3 className="text-base font-semibold text-ink">Resultados</h3>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-xs text-muted">{exportando ? 'Exportando…' : 'Exportar:'}</span>
+                <BotonExportar onClick={() => exportar('xlsx')} disabled={exportando} titulo="Excel con las hojas Sujetos, Aristas y Nodos">
+                  Excel completo
+                </BotonExportar>
+                <BotonExportar onClick={() => exportar('csv', 'sujetos')} disabled={exportando} titulo="Una fila por sujeto: metadatos, parámetros, métricas y las 54 características">
+                  CSV sujetos
+                </BotonExportar>
+                <BotonExportar onClick={() => exportar('csv', 'aristas')} disabled={exportando} titulo="Una fila por arista de cada sujeto">
+                  CSV aristas
+                </BotonExportar>
+                <BotonExportar onClick={() => exportar('csv', 'nodos')} disabled={exportando} titulo="Una fila por nodo de cada sujeto">
+                  CSV nodos
+                </BotonExportar>
+              </div>
+            </div>
             <div className="flex-1 min-h-0 overflow-auto bg-surface rounded-lg border border-line">
               <table className="min-w-full divide-y divide-line">
                 <thead className="bg-bg sticky top-0">
