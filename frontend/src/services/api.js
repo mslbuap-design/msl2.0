@@ -272,10 +272,22 @@ export async function grafosCorte(payload) {
 /**
  * POST /api/grafos/exportar — exporta los datos de los grafos analizados a CSV (una tabla) o Excel (todas).
  * Devuelve el archivo en Base64 (`contenido_base64`) además de guardarlo en Resultados_<proyecto>/grafos/.
- * @param {{rutas_json: string[], formato: 'csv'|'xlsx', tabla?: 'sujetos'|'aristas'|'nodos', ruta_proyecto?: string}} payload
+ * Con `comparacion` (la respuesta de grafosComparar) el Excel suma las hojas Comparación/Pares, y el CSV puede ser
+ * la tabla 'comparacion' o 'pares' (esas dos no necesitan `rutas_json`).
+ * @param {{rutas_json: string[], formato: 'csv'|'xlsx', tabla?: 'sujetos'|'aristas'|'nodos'|'comparacion'|'pares', comparacion?: Object, ruta_proyecto?: string}} payload
  */
 export async function grafosExportar(payload) {
   const { data } = await client.post('/api/grafos/exportar', payload);
+  return data;
+}
+
+/**
+ * POST /api/grafos/comparar — comparación estadística entre grupos (Fase 3B): un valor por sujeto y característica,
+ * prueba principal, tamaños de efecto y corrección por comparaciones múltiples. `grupos`: la referencia va primero.
+ * @param {{sujetos: {archivo: string, grupo: string, caracteristicas: Object<string, number|null>}[], grupos: string[], prueba_principal: 'no_parametrica'|'parametrica', alfa: number}} payload
+ */
+export async function grafosComparar(payload) {
+  const { data } = await client.post('/api/grafos/comparar', payload);
   return data;
 }
 
@@ -305,4 +317,5 @@ export default {
   analisisGrafos,
   grafosCorte,
   grafosExportar,
+  grafosComparar,
 };

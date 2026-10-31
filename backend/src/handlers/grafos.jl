@@ -146,20 +146,27 @@ function handler_grafos_exportar(req, params)
     formato = String(get(request_data, "formato", "xlsx"))
     tabla = String(get(request_data, "tabla", "sujetos"))
     ruta_proyecto = String(get(request_data, "ruta_proyecto", ""))
+    # Resultado de /api/grafos/comparar (opcional): suma las hojas Comparación / Pares al Excel
+    # y permite exportar la comparación sola como CSV (tabla "comparacion" o "pares").
+    comparacion = _a_dict(get(request_data, "comparacion", nothing))
+    solo_comparacion = formato == "csv" && tabla in ("comparacion", "pares")
 
-    if isempty(rutas)
+    if isempty(rutas) && !solo_comparacion
         return error_response(400, "No hay grafos para exportar: ejecuta primero el análisis")
     end
     if !(formato in ("csv", "xlsx"))
         return error_response(400, "formato inválido: '$formato' (esperado csv o xlsx)")
     end
-    if !(tabla in ("sujetos", "aristas", "nodos"))
-        return error_response(400, "tabla inválida: '$tabla' (esperado sujetos, aristas o nodos)")
+    if !(tabla in ("sujetos", "aristas", "nodos", "comparacion", "pares"))
+        return error_response(400, "tabla inválida: '$tabla' (esperado sujetos, aristas, nodos, comparacion o pares)")
+    end
+    if solo_comparacion && comparacion === nothing
+        return error_response(400, "No hay comparación para exportar: compara los grupos primero")
     end
 
     try
         ruta_resultados = determinar_ruta_resultados(ruta_proyecto)
-        resultado = exportar_grafos(rutas, formato, tabla, joinpath(ruta_resultados, "grafos"))
+        resultado = exportar_grafos(rutas, formato, tabla, joinpath(ruta_resultados, "grafos"); comparacion=comparacion)
         return json_response(200, resultado)
     catch e
         println("❌ Error exportando grafos: ", e)
@@ -167,5 +174,51 @@ function handler_grafos_exportar(req, params)
     end
 end
 
+# ------------------------------------------------------------------------
+# POST /api/grafos/comparar
+# ------------------------------------------------------------------------
+# Comparación estadística entre grupos (Fase 3B), sobre los resultados del análisis
+# que el navegador ya tiene: un valor por SUJETO y característica. Síncrono: es rápido
+# (54 características × unos pocos grupos). Body:
+#   { "sujetos": [{"archivo", "grupo", "caracteristicas": {clave: número|null}}],
+#     "grupos": ["Sanos", "Enfermos"]   (REFERENCIA PRIMERO; ≥ 2),
+#     "prueba_principal": "no_parametrica" | "parametrica", "alfa": 0.05 }
+# Los errores de validación (grupo sin sujetos, el mismo archivo dos veces en un grupo, ...)
+# salen como 400 con el motivo; lo demás, 500. La lógica vive en ComparacionGrupos.jl.
+# ------------------------------------------------------------------------
+function handler_grafos_comparar(req, params)
+    request_data = leer_body_json(req)
+    sujetos = get(request_data, "sujetos", nothing)
+    grupos = String[String(g) for g in get(request_data, "grupos", String[])]
+    prueba_principal = String(get(request_data, "prueba_principal", "no_parametrica"))
+    alfa = get(request_data, "alfa", 0.05)
+
+    if !(sujetos isa AbstractVector) || isempty(sujetos)
+        return error_response(400, "No hay sujetos para comparar: ejecuta primero el análisis")
+    end
+    if length(grupos) < 2
+        return error_response(400, "Selecciona al menos 2 grupos para comparar")
+    end
+    if !(prueba_principal in ("no_parametrica", "parametrica"))
+        return error_response(400, "prueba_principal inválida: '$prueba_principal' (esperado no_parametrica o parametrica)")
+    end
+    if !(alfa isa Real) || !(0 < alfa < 1)
+        return error_response(400, "alfa inválido (esperado un número entre 0 y 1)")
+    end
+
+    try
+        resultado = comparar_grupos(sujetos, grupos, prueba_principal, Float64(alfa))
+        resultado["success"] = true
+        return json_response(200, resultado)
+    catch e
+        println("❌ Error comparando grupos: ", e)
+        if e isa ErrorException
+            return error_response(400, e.msg)
+        end
+        return error_response(500, string(e))
+    end
+end
+
 registrar_ruta!("POST", "/api/grafos/corte", handler_grafos_corte)
 registrar_ruta!("POST", "/api/grafos/exportar", handler_grafos_exportar)
+registrar_ruta!("POST", "/api/grafos/comparar", handler_grafos_comparar)

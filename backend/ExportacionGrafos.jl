@@ -15,6 +15,12 @@
 #             modelos con el sujeto como efecto aleatorio, etc.
 #   nodos   : una fila por nodo de cada sujeto (tipo, grado, posición).
 #
+# Además, si se le pasa el resultado de la comparación entre grupos (ComparacionGrupos.jl, Fase 3B):
+#   comparacion : una fila por característica (descriptivos por grupo, pruebas, tamaños de efecto, p, q, Holm).
+#   pares       : con más de 2 grupos, una fila por característica y par de grupos (post-hoc).
+# Ambas salen como CSV sueltos (`tabla` = "comparacion" | "pares", sin necesidad de grafos) y como hojas
+# "Comparación" / "Pares" del Excel.
+#
 # Formatos: CSV (UTF-8 con BOM para que Excel respete los acentos; coma como separador,
 # punto decimal; celda vacía = valor no calculable) y un Excel con una hoja por tabla.
 #
@@ -158,6 +164,86 @@ function tabla_por_nombre(docs, tabla::AbstractString)
 end
 
 # ------------------------------------------------------------------------------
+# Tablas de la comparación entre grupos (Fase 3B)
+# ------------------------------------------------------------------------------
+
+const _EXP_STATS_GRUPO = ["n", "mediana", "p25", "p75", "media", "sd"]
+
+"""Grupos de una comparación (`resumen.grupos`), en el orden en que se compararon (el primero es la referencia)."""
+function _grupos_de_comparacion(comparacion)
+    g = _exp_get(comparacion, "resumen", "grupos")
+    (g isa AbstractVector && !isempty(g)) || error("La comparación no trae los grupos (¿es el resultado de /api/grafos/comparar?)")
+    return String[string(x) for x in g]
+end
+
+"""`(columnas, filas)` de la comparación: una fila por característica, con descriptivos por grupo (n, mediana, p25, p75,
+media, sd), la prueba principal y la otra, el tamaño de efecto (AUC, δ de Cliff y g de Hedges con 2 grupos; ε² y η² con más),
+p (de la principal), q de Benjamini–Hochberg y p de Holm. Vacío = no calculable."""
+function tabla_comparacion(comparacion)
+    grupos = _grupos_de_comparacion(comparacion)
+    cols = String["caracteristica", "estado"]
+    for g in grupos
+        for s in _EXP_STATS_GRUPO
+            push!(cols, s * "_" * g)
+        end
+    end
+    append!(cols, ["mayor_en", "prueba_principal", "estadistico", "gl", "p", "metodo", "otra_prueba", "estadistico_otra", "gl_otra", "p_otra",
+                   "auc", "auc_ic_inf", "auc_ic_sup", "cliff_delta", "cliff_ic_inf", "cliff_ic_sup", "hedges_g", "hedges_ic_inf", "hedges_ic_sup",
+                   "epsilon2", "eta2", "p_min_posible", "q_bh", "p_holm", "significativa", "nota"])
+    filas = Vector{Any}[]
+    resultados = _exp_get(comparacion, "resultados")
+    for r in (resultados isa AbstractVector ? resultados : Any[])
+        pp = _exp_get(r, "prueba_principal")
+        op = _exp_get(r, "otra_prueba")
+        ef = _exp_get(r, "efecto")
+        fila = Any[_exp_get(r, "clave"), _exp_get(r, "estado")]
+        for g in grupos
+            push!(fila, _exp_get(r, "n", g))
+            for s in _EXP_STATS_GRUPO[2:end]
+                push!(fila, _exp_get(r, "descriptivos", g, s))
+            end
+        end
+        append!(fila, Any[_exp_get(r, "mayor_en"), _exp_get(pp, "nombre"), _exp_get(pp, "estadistico"), _exp_unir(_exp_get(pp, "gl"), ";"),
+                          _exp_get(r, "p"), _exp_get(pp, "metodo"), _exp_get(op, "nombre"), _exp_get(op, "estadistico"),
+                          _exp_unir(_exp_get(op, "gl"), ";"), _exp_get(op, "p"),
+                          _exp_get(ef, "auc"), _exp_elem(_exp_get(ef, "auc_ic"), 1), _exp_elem(_exp_get(ef, "auc_ic"), 2),
+                          _exp_get(ef, "cliff_delta"), _exp_elem(_exp_get(ef, "cliff_ic"), 1), _exp_elem(_exp_get(ef, "cliff_ic"), 2),
+                          _exp_get(ef, "hedges_g"), _exp_elem(_exp_get(ef, "hedges_ic"), 1), _exp_elem(_exp_get(ef, "hedges_ic"), 2),
+                          _exp_get(ef, "epsilon2"), _exp_get(ef, "eta2"), _exp_get(r, "p_min_posible"), _exp_get(r, "q_bh"),
+                          _exp_get(r, "p_holm"), _exp_get(r, "significativa"), _exp_get(r, "nota")])
+        push!(filas, fila)
+    end
+    return cols, filas
+end
+
+const EXPORT_COLUMNAS_PARES = ["caracteristica", "grupo_a", "grupo_b", "u", "p", "metodo", "p_holm", "mayor_en", "auc", "auc_ic_inf", "auc_ic_sup",
+                               "cliff_delta", "cliff_ic_inf", "cliff_ic_sup"]
+
+"""`(columnas, filas)` del post-hoc por pares (solo hay filas con más de 2 grupos). Cada par (a, b) se lee "b frente a a"."""
+function tabla_pares(comparacion)
+    filas = Vector{Any}[]
+    resultados = _exp_get(comparacion, "resultados")
+    for r in (resultados isa AbstractVector ? resultados : Any[])
+        pares = _exp_get(r, "pares")
+        pares isa AbstractVector || continue
+        for par in pares
+            push!(filas, Any[_exp_get(r, "clave"), _exp_get(par, "a"), _exp_get(par, "b"), _exp_get(par, "u"), _exp_get(par, "p"),
+                             _exp_get(par, "metodo"), _exp_get(par, "p_holm"), _exp_get(par, "mayor_en"), _exp_get(par, "auc"),
+                             _exp_elem(_exp_get(par, "auc_ic"), 1), _exp_elem(_exp_get(par, "auc_ic"), 2), _exp_get(par, "cliff_delta"),
+                             _exp_elem(_exp_get(par, "cliff_ic"), 1), _exp_elem(_exp_get(par, "cliff_ic"), 2)])
+        end
+    end
+    return EXPORT_COLUMNAS_PARES, filas
+end
+
+"""`(columnas, filas)` de una tabla de la comparación ("comparacion" o "pares")."""
+function tabla_comparacion_por_nombre(comparacion, tabla::AbstractString)
+    tabla == "comparacion" && return tabla_comparacion(comparacion)
+    tabla == "pares" && return tabla_pares(comparacion)
+    error("tabla desconocida: '$tabla' (esperado comparacion o pares)")
+end
+
+# ------------------------------------------------------------------------------
 # CSV
 # ------------------------------------------------------------------------------
 
@@ -213,8 +299,9 @@ function _escribir_hoja!(hoja, columnas, filas)
     return nothing
 end
 
-"""Escribe un Excel con una hoja por tabla (Sujetos, Aristas, Nodos) y una hoja "Leeme"."""
-function escribir_xlsx(ruta::AbstractString, docs)
+"""Escribe un Excel con una hoja por tabla (Sujetos, Aristas, Nodos) y una hoja "Leeme". Si se pasa `comparacion`
+(resultado de `comparar_grupos`), agrega las hojas "Comparación" y, con más de 2 grupos, "Pares"."""
+function escribir_xlsx(ruta::AbstractString, docs; comparacion=nothing)
     XLSX.openxlsx(ruta, mode="w") do xf
         hoja = xf[1]
         XLSX.rename!(hoja, "Sujetos")
@@ -225,6 +312,17 @@ function escribir_xlsx(ruta::AbstractString, docs)
             XLSX.addsheet!(xf, nombre)
             c, f = tabla_por_nombre(docs, tabla)
             _escribir_hoja!(xf[nombre], c, f)
+        end
+
+        if comparacion !== nothing
+            XLSX.addsheet!(xf, "Comparación")
+            cc, ff = tabla_comparacion(comparacion)
+            _escribir_hoja!(xf["Comparación"], cc, ff)
+            cp, fp = tabla_pares(comparacion)
+            if !isempty(fp)
+                XLSX.addsheet!(xf, "Pares")
+                _escribir_hoja!(xf["Pares"], cp, fp)
+            end
         end
 
         XLSX.addsheet!(xf, "Leeme")
@@ -239,6 +337,12 @@ function escribir_xlsx(ruta::AbstractString, docs)
             "Celda vacía = valor no calculable (no es cero).",
             "grupo = carpeta que contiene al archivo. Definiciones de cada métrica: docs/CAMBIOS_PARA_GRAFOS.md.",
         ]
+        if comparacion !== nothing
+            lista = join(_grupos_de_comparacion(comparacion), ", ")
+            push!(lineas, "Hoja Comparación: una fila por característica. Grupos: $(lista) (el primero es la referencia). Prueba principal: $(_exp_get(comparacion, "resumen", "prueba_principal")); α = $(_exp_get(comparacion, "resumen", "alfa")).")
+            push!(lineas, "Comparación: AUC, δ de Cliff y g de Hedges se leen 'grupo comparado frente a la referencia' (positivo = el comparado tiende a valores mayores). q_bh = Benjamini–Hochberg sobre las características con estado ok; p_holm = Holm.")
+            push!(lineas, "Hoja Pares (solo con más de 2 grupos): Mann–Whitney por pares, p ajustado por Holm dentro de cada característica.")
+        end
         for (i, l) in enumerate(lineas)
             leeme[XLSX.CellRef(i, 1)] = l
         end
@@ -261,13 +365,16 @@ function _ruta_exportable(ruta::AbstractString)
 end
 
 """
-    exportar_grafos(rutas_json, formato, tabla, dir_salida) -> Dict
+    exportar_grafos(rutas_json, formato, tabla, dir_salida; comparacion=nothing) -> Dict
 
 `formato`: "csv" (una `tabla`: "sujetos", "aristas" o "nodos") o "xlsx" (todas las tablas en un libro).
+Con `comparacion` (el resultado de `comparar_grupos`), el Excel suma las hojas "Comparación" y "Pares", y el CSV puede
+ser la tabla "comparacion" o "pares" (esas dos no necesitan grafos: `rutas_json` puede ir vacío).
 Guarda el archivo en `dir_salida` (si se da) y devuelve su contenido en Base64 para que el navegador lo descargue.
 """
 function exportar_grafos(rutas_json::Vector{String}, formato::AbstractString, tabla::AbstractString,
-                         dir_salida::Union{AbstractString,Nothing})
+                         dir_salida::Union{AbstractString,Nothing}; comparacion=nothing)
+    solo_comparacion = formato == "csv" && (tabla == "comparacion" || tabla == "pares")
     docs = Dict{String,Any}[]
     omitidos = String[]
     for r in rutas_json
@@ -277,7 +384,7 @@ function exportar_grafos(rutas_json::Vector{String}, formato::AbstractString, ta
             push!(omitidos, r)
         end
     end
-    isempty(docs) && error("No se pudo leer ningún grafo exportable (¿se movieron o borraron los JSON de Resultados_*/grafos?)")
+    (!solo_comparacion && isempty(docs)) && error("No se pudo leer ningún grafo exportable (¿se movieron o borraron los JSON de Resultados_*/grafos?)")
 
     marca = Dates.format(now(), "yyyymmdd_HHMMSS")
     if dir_salida !== nothing
@@ -286,7 +393,12 @@ function exportar_grafos(rutas_json::Vector{String}, formato::AbstractString, ta
     carpeta = dir_salida === nothing ? tempdir() : String(dir_salida)
 
     if formato == "csv"
-        columnas, filas = tabla_por_nombre(docs, tabla)
+        if solo_comparacion
+            comparacion === nothing && error("No hay comparación para exportar: compara los grupos primero")
+            columnas, filas = tabla_comparacion_por_nombre(comparacion, tabla)
+        else
+            columnas, filas = tabla_por_nombre(docs, tabla)
+        end
         nombre = "grafos_$(tabla)_$(marca).csv"
         ruta = joinpath(carpeta, nombre)
         write(ruta, tabla_a_csv(columnas, filas))
@@ -294,7 +406,7 @@ function exportar_grafos(rutas_json::Vector{String}, formato::AbstractString, ta
     elseif formato == "xlsx"
         nombre = "grafos_$(marca).xlsx"
         ruta = joinpath(carpeta, nombre)
-        escribir_xlsx(ruta, docs)
+        escribir_xlsx(ruta, docs; comparacion=comparacion)
         mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else
         error("formato desconocido: '$formato' (esperado csv o xlsx)")
@@ -331,6 +443,37 @@ function _doc_de_prueba(archivo, grupo)
         ),
         "avanzadas" => Dict{String,Any}("caracteristicas" => Dict{String,Any}("radio_media_mm" => 2.5, "strahler_max" => 4, "angulo_hijas_media_deg" => nothing)),
     )
+end
+
+"""`true` si `f()` lanza una excepción (para las autopruebas)."""
+function _exp_falla(f)
+    try
+        f()
+        return false
+    catch
+        return true
+    end
+end
+
+"""Resultado de comparación armado a mano (3 grupos: una característica con post-hoc y otra omitida), con la forma de `comparar_grupos`."""
+function _comparacion_de_prueba()
+    desc(n, m) = Dict{String,Any}("n" => n, "mediana" => m, "p25" => m - 0.3, "p75" => m + 0.3, "media" => m, "sd" => 0.3)
+    return Dict{String,Any}(
+        "resumen" => Dict{String,Any}("grupos" => Any["Sanos", "Enfermos", "Otros"], "referencia" => "Sanos", "prueba_principal" => "no_parametrica", "alfa" => 0.05, "m" => 1),
+        "resultados" => Any[
+            Dict{String,Any}("clave" => "radio_media_mm", "estado" => "ok", "n" => Dict{String,Any}("Sanos" => 5, "Enfermos" => 6, "Otros" => 4),
+                             "descriptivos" => Dict{String,Any}("Sanos" => desc(5, 1.5), "Enfermos" => desc(6, 2.5), "Otros" => desc(4, 2.0)),
+                             "mayor_en" => "Enfermos",
+                             "prueba_principal" => Dict{String,Any}("nombre" => "Kruskal–Wallis H", "estadistico" => 4.5, "gl" => 2, "p" => 0.1, "metodo" => nothing),
+                             "otra_prueba" => Dict{String,Any}("nombre" => "ANOVA de Welch F", "estadistico" => 9.1, "gl" => Any[2, 9.6], "p" => 0.005, "metodo" => nothing),
+                             "efecto" => Dict{String,Any}("epsilon2" => 0.27, "eta2" => 0.21), "p_min_posible" => nothing,
+                             "p" => 0.1, "q_bh" => 0.1, "p_holm" => 0.1, "significativa" => false,
+                             "pares" => Any[Dict{String,Any}("a" => "Sanos", "b" => "Enfermos", "u" => 30.0, "p" => 0.004, "metodo" => "exacto", "p_holm" => 0.012,
+                                                             "mayor_en" => "Enfermos", "auc" => 1.0, "auc_ic" => nothing, "cliff_delta" => 1.0, "cliff_ic" => nothing)],
+                             "nota" => nothing),
+            Dict{String,Any}("clave" => "longitud_max_mm", "estado" => "omitida", "n" => Dict{String,Any}("Sanos" => 5, "Enfermos" => 1, "Otros" => 4),
+                             "significativa" => false, "nota" => "Se omite: con menos de 2 sujetos en Enfermos."),
+        ])
 end
 
 function autoprueba_exportacion()
@@ -390,6 +533,34 @@ function autoprueba_exportacion()
     res2 = exportar_grafos(vcat(rutas, ["/etc/passwd"]), "xlsx", "sujetos", dir)
     ok &= chequear("exportar Excel: genera el libro y omite la ruta no permitida",
                    res2["success"] == true && isfile(res2["ruta"]) && res2["omitidos"] == ["/etc/passwd"] && filesize(res2["ruta"]) > 0)
+
+    # comparación entre grupos (Fase 3B): tablas, CSV sin grafos y hojas del Excel
+    cmp = _comparacion_de_prueba()
+    ccols, cfilas = tabla_comparacion(cmp)
+    cpos(n) = findfirst(==(n), ccols)
+    ok &= chequear("comparación: 46 columnas (2 + 6 por grupo × 3 + 26), únicas, y una fila por característica con todas las celdas",
+                   length(ccols) == 46 && length(unique(ccols)) == 46 && length(cfilas) == 2 && all(f -> length(f) == 46, cfilas))
+    ok &= chequear("comparación: descriptivos por grupo en columnas propias, p/q/ε² bien ubicados y gl del ANOVA unidos con ';'",
+                   cfilas[1][cpos("n_Enfermos")] == 6 && cfilas[1][cpos("mediana_Otros")] == 2.0 && cfilas[1][cpos("p")] == 0.1 &&
+                   cfilas[1][cpos("epsilon2")] == 0.27 && cfilas[1][cpos("gl_otra")] == "2;9.6" && cfilas[1][cpos("significativa")] == false)
+    ok &= chequear("comparación: con más de 2 grupos no hay AUC/δ/g (vacío, no 0); la característica omitida queda con su n, su nota y sin p",
+                   cfilas[1][cpos("auc")] === nothing && cfilas[1][cpos("hedges_g")] === nothing && cfilas[2][cpos("estado")] == "omitida" &&
+                   cfilas[2][cpos("p")] === nothing && cfilas[2][cpos("n_Enfermos")] == 1 && occursin("Enfermos", cfilas[2][cpos("nota")]))
+    pcols, pfilas = tabla_pares(cmp)
+    ok &= chequear("pares: 14 columnas y 1 fila (solo la característica con post-hoc), par (Sanos, Enfermos)",
+                   length(pcols) == 14 && length(pfilas) == 1 && length(pfilas[1]) == 14 && pfilas[1][2] == "Sanos" && pfilas[1][3] == "Enfermos" && pfilas[1][7] == 0.012)
+    ok &= chequear("comparación sin grupos: error claro", _exp_falla(() -> tabla_comparacion(Dict{String,Any}("resultados" => Any[]))))
+    res3 = exportar_grafos(String[], "csv", "comparacion", dir; comparacion=cmp)
+    texto3 = String(base64decode(res3["contenido_base64"]))
+    ok &= chequear("exportar CSV de la comparación SIN grafos: se guarda, trae las características y el nombre del grupo en las columnas",
+                   res3["success"] == true && isfile(res3["ruta"]) && texto3 == read(res3["ruta"], String) && occursin("radio_media_mm", texto3) &&
+                   occursin("mediana_Enfermos", texto3) && occursin("Kruskal–Wallis H", texto3))
+    ok &= chequear("exportar CSV de la comparación sin pasar la comparación: error", _exp_falla(() -> exportar_grafos(String[], "csv", "comparacion", dir)))
+    res4 = exportar_grafos(rutas, "xlsx", "sujetos", dir; comparacion=cmp)
+    hojas = XLSX.sheetnames(XLSX.readxlsx(res4["ruta"]))
+    ok &= chequear("exportar Excel con comparación: hojas Comparación y Pares antes del Leeme", "Comparación" in hojas && "Pares" in hojas && hojas[end] == "Leeme")
+    res5 = exportar_grafos(rutas, "xlsx", "sujetos", dir)
+    ok &= chequear("exportar Excel sin comparación: no hay hojas Comparación ni Pares", !("Comparación" in XLSX.sheetnames(XLSX.readxlsx(res5["ruta"]))))
     rm(base; recursive=true, force=true)
 
     println(ok ? "✅ Autoprueba de la exportación: todo en orden" : "❌ Autoprueba de la exportación: HAY FALLOS")

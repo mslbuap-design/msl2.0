@@ -3,6 +3,7 @@ import * as api from '../../services/api.js';
 import { useProjectContext } from '../../context/ProjectContext.jsx';
 import { useNativeDialogs } from '../../hooks/useNativeDialogs.js';
 import { extractAllCompatibleFiles } from '../../utils/fileTree.js';
+import { sujetosDeResultados } from './comparacionUtils.js';
 import { PARAMS_POR_DEFECTO, construirOpciones, descargarArchivo } from './graphUtils.js';
 
 /**
@@ -15,6 +16,10 @@ import { PARAMS_POR_DEFECTO, construirOpciones, descargarArchivo } from './graph
  * de los dos anteriores por `construirOpciones`: solo lo que difiere del
  * default). `erroresParams` impide lanzar el análisis mientras haya algún
  * campo inválido.
+ *
+ * Comparación entre grupos (Fase 3B): `sujetosComparables` sale de los resultados del análisis (un sujeto por
+ * archivo, con sus 54 características), `comparar(peticion)` llama a /api/grafos/comparar y deja el resultado en
+ * `comparacion`, que se descarta al lanzar otro análisis (ya no corresponde a los resultados en pantalla).
  *
  * `tipoGrafo` está fijo en `'vascular'` por ahora (única rama implementada en
  * el backend; `'conectividad'` responde 501). Cuando se implemente la segunda
@@ -34,6 +39,8 @@ export function useGraphs() {
   const [bbox, setBbox] = useState(null);
   const [regionAbierta, setRegionAbierta] = useState(false);
   const [exportando, setExportando] = useState(false);
+  const [comparacion, setComparacion] = useState(null);
+  const [comparando, setComparando] = useState(false);
 
   // Al activarse la pestaña, forzar modo múltiple (igual que en Radiómica).
   const wasActive = useRef(false);
@@ -50,6 +57,8 @@ export function useGraphs() {
     : selectedFile
       ? [selectedFile]
       : [];
+
+  const sujetosComparables = useMemo(() => sujetosDeResultados(graphsResults), [graphsResults]);
 
   const { opciones, errores: erroresParams } = useMemo(() => construirOpciones(params, bbox), [params, bbox]);
 
@@ -71,6 +80,7 @@ export function useGraphs() {
 
     setGraphsRunning(true);
     setGraphsResults(null);
+    setComparacion(null);
     setExpandedResult(null);
 
     try {
@@ -97,20 +107,36 @@ export function useGraphs() {
   }, [filesToAnalyze, tipoGrafo, opciones, erroresParams, project, notify]);
 
   /**
-   * Exporta los datos de los grafos analizados: "xlsx" (todas las tablas en un libro) o "csv" (una
-   * tabla: sujetos, aristas o nodos). El backend los lee de los JSON que guardó el análisis y los
-   * devuelve en Base64; acá se dispara la descarga.
+   * Compara los grupos (Fase 3B). `peticion` sale de `construirPeticion` (comparacionUtils.js): sujetos de los
+   * grupos elegidos, grupos con la referencia primero, prueba principal y α. Los errores de validación del
+   * backend (400) llegan con el motivo y se muestran tal cual.
    */
-  const exportar = useCallback(
-    async (formato, tabla = 'sujetos') => {
-      const rutas = (graphsResults || []).filter((r) => r.success && r.grafo?.ruta_json).map((r) => r.grafo.ruta_json);
-      if (rutas.length === 0) {
-        notify('No hay resultados para exportar');
-        return;
+  const comparar = useCallback(
+    async (peticion) => {
+      setComparando(true);
+      try {
+        const res = await api.grafosComparar(peticion);
+        if (res.success) {
+          setComparacion(res);
+        } else {
+          notify(`❌ Error: ${res.error}`);
+        }
+      } catch (error) {
+        console.error('Error:', error);
+        notify('Error de conexión al comparar');
+      } finally {
+        setComparando(false);
       }
+    },
+    [notify],
+  );
+
+  /** Pide la exportación y dispara la descarga del archivo (Base64) que devuelve el backend. */
+  const pedirExportacion = useCallback(
+    async (payload) => {
       setExportando(true);
       try {
-        const res = await api.grafosExportar({ rutas_json: rutas, formato, tabla, ruta_proyecto: project?.ruta || '' });
+        const res = await api.grafosExportar({ ...payload, ruta_proyecto: project?.ruta || '' });
         if (res.success) {
           descargarArchivo(res.nombre, res.mime, res.contenido_base64);
           if (res.omitidos?.length) notify(`Se omitieron ${res.omitidos.length} grafo(s) que no se pudieron leer`);
@@ -124,7 +150,36 @@ export function useGraphs() {
         setExportando(false);
       }
     },
-    [graphsResults, project, notify],
+    [project, notify],
+  );
+
+  /**
+   * Exporta los datos de los grafos analizados: "xlsx" (todas las tablas en un libro, con las hojas
+   * Comparación/Pares si ya se comparó) o "csv" (una tabla: sujetos, aristas o nodos). El backend los lee de
+   * los JSON que guardó el análisis y los devuelve en Base64; acá se dispara la descarga.
+   */
+  const exportar = useCallback(
+    async (formato, tabla = 'sujetos') => {
+      const rutas = (graphsResults || []).filter((r) => r.success && r.grafo?.ruta_json).map((r) => r.grafo.ruta_json);
+      if (rutas.length === 0) {
+        notify('No hay resultados para exportar');
+        return;
+      }
+      await pedirExportacion({ rutas_json: rutas, formato, tabla, ...(formato === 'xlsx' && comparacion ? { comparacion } : {}) });
+    },
+    [graphsResults, comparacion, pedirExportacion, notify],
+  );
+
+  /** Exporta solo la comparación como CSV: tabla "comparacion" (una fila por característica) o "pares" (post-hoc). */
+  const exportarComparacion = useCallback(
+    async (tabla) => {
+      if (!comparacion) {
+        notify('Primero compara los grupos');
+        return;
+      }
+      await pedirExportacion({ rutas_json: [], formato: 'csv', tabla, comparacion });
+    },
+    [comparacion, pedirExportacion, notify],
   );
 
   return {
@@ -150,5 +205,11 @@ export function useGraphs() {
     setRegionAbierta,
     exportando,
     exportar,
+    // comparación entre grupos (Fase 3B)
+    sujetosComparables,
+    comparacion,
+    comparando,
+    comparar,
+    exportarComparacion,
   };
 }
