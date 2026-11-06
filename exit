@@ -1,0 +1,59 @@
+[33mcommit 0854a1843529b24480c1c048969b68a110ba4298[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mgraphs[m[33m, [m[1;31morigin/graphs[m[33m)[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Fri Oct 30 23:03:30 2026 -0600
+
+    Autopruebas ejecutadas, todo correcto; se agregó analisis por grupos
+
+[33mcommit ab241b6446609ba87d05ba07f4bc9cebfbf661e3[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sun Oct 25 18:44:16 2026 -0600
+
+    Exportación activa
+
+[33mcommit 8c6fab9a8c779bbe53be88799683aaabe2d3907b[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Mon Oct 19 00:13:38 2026 -0600
+
+    Estadistica agregada, por probar
+
+[33mcommit 0e8bbf546bb39ab8a1957816511a986486b43c5d[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sun Oct 18 23:57:36 2026 -0600
+
+    Estadistica en rpoceso
+
+[33mcommit 527527f004fe115a6930d1cfd1555341daf377fe[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Mon Oct 12 10:59:24 2026 -0600
+
+    Primera versión con detección de grafos
+
+[33mcommit c97e41d81d8d79743788da535c3534706dc27c17[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sat Oct 10 13:20:29 2026 -0600
+
+    Prueba de deteccion vascular
+
+[33mcommit 64eb3296caea1410c8cbd0a1d1ccf94a600d0fe2[m[33m ([m[1;31morigin/main[m[33m, [m[1;32mmain[m[33m)[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sun Sep 27 12:09:38 2026 -0600
+
+    Se agregó el Manual para programadores
+
+[33mcommit 610dbbe29dcf51d51af343db46fc4985a2594bfd[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sun Sep 27 12:09:00 2026 -0600
+
+    Se agregó el Manual para programadores
+
+[33mcommit d68b22a3fd47b377498162ef8ec7cd154257917a[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sun Sep 27 11:40:54 2026 -0600
+
+    Se agregó README
+
+[33mcommit c5a9eb42261c616a9a0fe1d0958ff4356f52f7f2[m
+Author: LarkDsc <angel.perez.strong@gmail.com>
+Date:   Sat Sep 26 20:14:11 2026 -0600
+
+    Refactorización de la app para mejorar el flujo de trabajo

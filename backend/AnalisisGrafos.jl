@@ -21,7 +21,7 @@
 # (reservado, el handler lo rechaza con 501 antes de llegar acá).
 #
 # Estos algoritmos se escribieron y verificaron primero en un prototipo de
-# referencia en Python (docs/referencia/prototipo_fase2.py) sobre fantomas con
+# referencia en Python (docs/TestGraph/prototipo_fase2.py) sobre fantomas con
 # respuesta conocida; este código Julia es el port de esa misma lógica.
 # `autoprueba_grafos()` (al final) repite los fantomas clave y se puede correr
 # suelta, sin archivos de imagen:
@@ -279,7 +279,8 @@ struct _ArcoGrafo
     u::Int
     v::Int
     longitud::Float64     # mm, a lo largo de la línea central (suavizada)
-    rad_long::Float64     # suma de (radio local × longitud): para promediar radios ponderando por longitud
+    rad_long::Float64     # suma de (radio EDT × longitud): lo usan la poda y la dirección de los extremos
+    rad_vol_long::Float64 # suma de (radio por volumen × longitud): el radio que se INFORMA (ver `_radio_por_volumen`)
     n_vox::Int
     dir_u::NTuple{3,Float64}   # vector unitario (mm) con el que la arista SALE del extremo u (para ángulos de bifurcación)
     dir_v::NTuple{3,Float64}   # ídem en el extremo v
@@ -344,6 +345,139 @@ function _suavizar_polilinea(pts::Matrix{Float64}, w::Int)
     return out
 end
 
+# --- radio por volumen -------------------------------------------------------------
+#
+# El radio "local" de la transformada de distancia (EDT) tiene dos defectos medibles: queda cuantizado a la
+# rejilla, con un mínimo de UN vóxel (en un estudio con vóxel de 1,40625 mm, el percentil 10 del radio salía
+# idéntico —1,40625 mm— en todos los sujetos), y subestima de forma sistemática (−2 % a −9 % con tubos de 2 a 5 mm)
+# y con un error que depende del calibre, así que un grupo con vasos más gruesos queda sesgado distinto.
+# El estimador por volumen reparte los vóxeles de la máscara entre los del esqueleto (el más cercano) y calcula,
+# para cada arista, R = sqrt(V / (π·L)), con V = volumen de las celdas de sus vóxeles de camino y L = su
+# longitud, sin los extremos. Probado con fantomas de radio conocido en docs/TestGraph/prototipo_radio.py, con
+# orientación y fase de rejilla al azar: |sesgo| ≤ 1,1 % y dispersión de 0,2–2 % (la EDT: −2 % a −9 % y 0,5–5 %).
+
+"""Desplazamientos `(di, dj, dk, peso_mm)` a los 26 vecinos, separados en los que ya se visitaron en un barrido hacia
+adelante (orden k, j, i; i el más rápido) y los que se visitan en el barrido de vuelta."""
+function _desplazamientos_chamfer(voxel_dims)
+    sx, sy, sz = Float64(voxel_dims[1]), Float64(voxel_dims[2]), Float64(voxel_dims[3])
+    adelante = Tuple{Int,Int,Int,Float64}[]
+    atras = Tuple{Int,Int,Int,Float64}[]
+    for dk in -1:1, dj in -1:1, di in -1:1
+        (di == 0 && dj == 0 && dk == 0) && continue
+        w = sqrt((di * sx)^2 + (dj * sy)^2 + (dk * sz)^2)
+        previo = dk < 0 || (dk == 0 && (dj < 0 || (dj == 0 && di < 0)))
+        push!(previo ? adelante : atras, (di, dj, dk, w))
+    end
+    return adelante, atras
+end
+
+"""
+Volumen (mm³) de la celda de cada vóxel del esqueleto: cada vóxel de la máscara se asigna al vóxel del esqueleto más
+cercano DENTRO de la máscara (distancia geodésica aproximada con pesos euclídeos en mm de los 26 vecinos, barridos hacia
+adelante y hacia atrás hasta que nada cambie). Devuelve un arreglo del tamaño de la máscara: en cada vóxel del
+esqueleto, el volumen de su celda; 0 en el resto.
+"""
+function _volumen_celdas_esqueleto(mascara::Array{Bool,3}, esq::Array{Bool,3}, voxel_dims; max_barridos::Int=20)
+    nx, ny, nz = size(mascara)
+    dominio = mascara .| esq
+    dist = fill(Inf, nx, ny, nz)
+    lab = zeros(Int32, nx, ny, nz)
+    for idx in eachindex(esq)
+        if esq[idx]
+            dist[idx] = 0.0
+            lab[idx] = Int32(idx)
+        end
+    end
+    adelante, atras = _desplazamientos_chamfer(voxel_dims)
+    barridos = 0
+    cambio = true
+    while cambio && barridos < max_barridos
+        cambio = false
+        barridos += 1
+        for k in 1:nz, j in 1:ny, i in 1:nx
+            dominio[i, j, k] || continue
+            d0 = dist[i, j, k]
+            for (di, dj, dk, w) in adelante
+                a = i + di
+                b = j + dj
+                c = k + dk
+                (1 <= a <= nx && 1 <= b <= ny && 1 <= c <= nz) || continue
+                dominio[a, b, c] || continue
+                cand = dist[a, b, c] + w
+                if cand < d0 - 1e-12
+                    d0 = cand
+                    dist[i, j, k] = cand
+                    lab[i, j, k] = lab[a, b, c]
+                    cambio = true
+                end
+            end
+        end
+        for k in nz:-1:1, j in ny:-1:1, i in nx:-1:1
+            dominio[i, j, k] || continue
+            d0 = dist[i, j, k]
+            for (di, dj, dk, w) in atras
+                a = i + di
+                b = j + dj
+                c = k + dk
+                (1 <= a <= nx && 1 <= b <= ny && 1 <= c <= nz) || continue
+                dominio[a, b, c] || continue
+                cand = dist[a, b, c] + w
+                if cand < d0 - 1e-12
+                    d0 = cand
+                    dist[i, j, k] = cand
+                    lab[i, j, k] = lab[a, b, c]
+                    cambio = true
+                end
+            end
+        end
+    end
+    vol = zeros(Float64, nx, ny, nz)
+    vv = Float64(voxel_dims[1]) * Float64(voxel_dims[2]) * Float64(voxel_dims[3])
+    for idx in eachindex(mascara)
+        if mascara[idx] && lab[idx] != 0
+            vol[lab[idx]] += vv
+        end
+    end
+    return vol
+end
+
+"""
+Radio de una arista por volumen: `R = sqrt(V / (π·L))`, con `V` = suma de los volúmenes de celda de sus vóxeles de
+camino y `L` = longitud de línea que les corresponde, SIN los extremos (los primeros y últimos `kappa·rad_edt` mm: cerca
+de una bifurcación o de una punta el volumen incluye la unión o la tapa y sesga el radio hacia arriba). `pts` es la
+polilínea suavizada 3×npts (nodo u, vóxeles de camino, nodo v), `vols[t]` el volumen de la celda del t-ésimo vóxel de
+camino (que está en `pts[:, t+1]`). Si tras recortar quedan menos de `n_min` vóxeles, se conserva el radio EDT
+`rad_edt`. Devuelve `(radio, usa_volumen)`.
+"""
+function _radio_por_volumen(pts::Matrix{Float64}, vols::Vector{Float64}, rad_edt::Float64; kappa::Float64=1.0, n_min::Int=3)
+    npts = size(pts, 2)
+    s = zeros(Float64, npts)
+    for t in 1:npts-1
+        s[t+1] = s[t] + sqrt((pts[1, t+1] - pts[1, t])^2 + (pts[2, t+1] - pts[2, t])^2 + (pts[3, t+1] - pts[3, t])^2)
+    end
+    L = s[npts]
+    tau = kappa * rad_edt
+    pa = 0
+    pb = 0
+    nk = 0
+    V = 0.0
+    for p in 2:npts-1
+        if s[p] >= tau && (L - s[p]) >= tau
+            pa == 0 && (pa = p)
+            pb = p
+            nk += 1
+            V += vols[p-1]
+        end
+    end
+    if nk >= n_min
+        Lk = 0.5 * (s[pb] + s[pb+1]) - 0.5 * (s[pa-1] + s[pa])
+        if Lk > 0 && V > 0
+            return sqrt(V / (pi * Lk)), true
+        end
+    end
+    return rad_edt, false
+end
+
 """
 Construye el grafo del esqueleto. Nodos = grupos de vóxeles del esqueleto
 con grado != 2 (grado = nº de vecinos 26): puntas (grado 1) y bifurcaciones
@@ -352,8 +486,12 @@ Aristas = cadenas de vóxeles de grado 2 entre dos nodos.
 
 Devuelve `(pos_mm, pos_vox, aristas)`: posiciones de los nodos (3×n, en mm
 desde el primer vóxel / en coordenadas de vóxel 1-indexadas) y las aristas.
+Con `vol_celda` (de `_volumen_celdas_esqueleto`) cada arista trae además su radio por
+volumen (`rad_vol_long`); sin él, ese radio es el de la EDT. La poda y la dirección de los
+extremos siguen usando el radio EDT (`rad_long`), así que la topología no cambia.
 """
-function _construir_grafo(esq::Array{Bool,3}, dt::Array{Float64,3}, voxel_dims; ventana::Int=2)
+function _construir_grafo(esq::Array{Bool,3}, dt::Array{Float64,3}, voxel_dims; ventana::Int=2,
+                          vol_celda::Union{Nothing,Array{Float64,3}}=nothing)
     nx, ny, nz = size(esq)
     mx, my, mz = nx + 2, ny + 2, nz + 2
     sx, sy, sz = Float64(voxel_dims[1]), Float64(voxel_dims[2]), Float64(voxel_dims[3])
@@ -479,7 +617,16 @@ function _construir_grafo(esq::Array{Bool,3}, dt::Array{Float64,3}, voxel_dims; 
                 for t in 1:npts-1
                     L += sqrt((pts[1, t+1] - pts[1, t])^2 + (pts[2, t+1] - pts[2, t])^2 + (pts[3, t+1] - pts[3, t])^2)
                 end
-                push!(aristas, _ArcoGrafo(cid, fin, L, rad * L, n_c,
+                r_vol = rad
+                if vol_celda !== nothing
+                    vols = zeros(Float64, n_c)
+                    for (t, c) in enumerate(camino)
+                        ci3, cj3, ck3 = _ijk_grafo(c, mx, my)
+                        vols[t] = vol_celda[ci3-1, cj3-1, ck3-1]
+                    end
+                    r_vol, _ = _radio_por_volumen(pts, vols, rad)
+                end
+                push!(aristas, _ArcoGrafo(cid, fin, L, rad * L, r_vol * L, n_c,
                                           _direccion_extremo(pts, true, rad), _direccion_extremo(pts, false, rad)))
             end
         end
@@ -550,7 +697,8 @@ function _podar_y_fusionar(aristas::Vector{_ArcoGrafo}, nn::Int, min_len::Float6
             o2 = a2.u == nodo ? a2.v : a2.u
             d1 = a1.u == nodo ? a1.dir_v : a1.dir_u      # dirección de a1 en su extremo o1
             d2 = a2.u == nodo ? a2.dir_v : a2.dir_u      # dirección de a2 en su extremo o2
-            push!(ar, _ArcoGrafo(o1, o2, a1.longitud + a2.longitud, a1.rad_long + a2.rad_long, a1.n_vox + a2.n_vox, d1, d2))
+            push!(ar, _ArcoGrafo(o1, o2, a1.longitud + a2.longitud, a1.rad_long + a2.rad_long, a1.rad_vol_long + a2.rad_vol_long,
+                             a1.n_vox + a2.n_vox, d1, d2))
             push!(vivas, true)
             nuevo = length(ar)
             push!(inc[o1], nuevo)
@@ -599,14 +747,14 @@ function _resumir_grafo(aristas::Vector{_ArcoGrafo}, deg::Vector{Int}, pos_mm::M
     aristas_json = Vector{Dict{String,Any}}()
     for (e, a) in enumerate(aristas)
         long_total += a.longitud
-        rad_long_total += a.rad_long
+        rad_long_total += a.rad_vol_long
         recta = sqrt((pos_mm[1, a.u] - pos_mm[1, a.v])^2 + (pos_mm[2, a.u] - pos_mm[2, a.v])^2 + (pos_mm[3, a.u] - pos_mm[3, a.v])^2)
         t = recta > 1e-9 ? a.longitud / recta : nothing
         t !== nothing && push!(tort, t)
         push!(aristas_json, Dict{String,Any}(
             "id" => e, "u" => nuevo_id[a.u], "v" => nuevo_id[a.v],
             "longitud_mm" => _fin(a.longitud),
-            "radio_medio_mm" => a.longitud > 0 ? _fin(a.rad_long / a.longitud) : nothing,
+            "radio_medio_mm" => a.longitud > 0 ? _fin(a.rad_vol_long / a.longitud) : nothing,
             "tortuosidad" => t === nothing ? nothing : _fin(t),
             "n_voxeles" => a.n_vox,
             "dir_u" => [_fin(a.dir_u[1]), _fin(a.dir_u[2]), _fin(a.dir_u[3])],
@@ -711,7 +859,8 @@ function _grafo_de_mascara(mascara::Array{Bool,3}, voxel_dims;
                             min_len::Float64=3.0, factor_radio::Float64=1.5, ventana::Int=2)
     dt = _transformada_distancia(mascara, voxel_dims)
     esq = _esqueletizar_3d(mascara, dt)
-    pos_mm, pos_vox, aristas = _construir_grafo(esq, dt, voxel_dims; ventana=ventana)
+    vol_celda = _volumen_celdas_esqueleto(mascara, esq, voxel_dims)
+    pos_mm, pos_vox, aristas = _construir_grafo(esq, dt, voxel_dims; ventana=ventana, vol_celda=vol_celda)
     ar, deg = _podar_y_fusionar(aristas, size(pos_mm, 2), min_len, factor_radio)
     return _resumir_grafo(ar, deg, pos_mm, pos_vox), esq
 end
@@ -1059,7 +1208,7 @@ end
 # AUTOPRUEBA — fantomas con respuesta conocida, sin necesitar archivos reales.
 #   julia --project=. -e 'include("AnalisisGrafos.jl"); autoprueba_grafos()'
 # Los resultados esperados salen del prototipo de referencia en Python
-# (docs/referencia/prototipo_fase2.py), que corrió los mismos fantomas.
+# (docs/TestGraph/prototipo_fase2.py), que corrió los mismos fantomas.
 # ==============================================================================
 
 """Máscara 3D de la unión de cápsulas `(p0, p1, radio)` (coordenadas 1-indexadas)."""
@@ -1074,6 +1223,30 @@ function _fantoma_capsulas(dims::NTuple{3,Int}, segs)
                 break
             end
         end
+    end
+    return m
+end
+
+"""Tubo recto de radio `R` (mm) y `largo` mm en la dirección `direccion`, centrado en el dominio y con un desplazamiento
+sub-vóxel `desp` (mm) que promedia la cuantización de la rejilla. El vóxel (i,j,k) (1-indexado) está centrado en
+((i−1)·sx, (j−1)·sy, (k−1)·sz) y es de la máscara si su centro está a distancia ≤ R del eje. Es el mismo fantoma que
+`tubo_recto` de docs/TestGraph/prototipo_radio.py, que calculó los errores esperados."""
+function _tubo_oblicuo_mm(R::Float64, dims, direccion, desp; largo::Float64=40.0, margen::Float64=12.0)
+    d = Float64[direccion[1], direccion[2], direccion[3]]
+    d ./= sqrt(sum(abs2, d))
+    h = Float64[dims[1], dims[2], dims[3]]
+    forma = ntuple(c -> Int(ceil((abs(d[c]) * largo + 2 * (R + margen)) / h[c])) + 1, 3)
+    centro = Float64[(forma[c] - 1) * h[c] / 2 + desp[c] for c in 1:3]
+    p0 = centro .- d .* (largo / 2)
+    dd = d .* largo
+    nn = sum(abs2, dd)
+    m = zeros(Bool, forma[1], forma[2], forma[3])
+    for k in 1:forma[3], j in 1:forma[2], i in 1:forma[1]
+        x = (i - 1) * h[1] - p0[1]
+        y = (j - 1) * h[2] - p0[2]
+        z = (k - 1) * h[3] - p0[3]
+        t = clamp((x * dd[1] + y * dd[2] + z * dd[3]) / nn, 0.0, 1.0)
+        m[i, j, k] = (x - t * dd[1])^2 + (y - t * dd[2])^2 + (z - t * dd[3])^2 <= R^2
     end
     return m
 end
@@ -1093,6 +1266,7 @@ function autoprueba_grafos()
                                           ((26, 26, 29), (39, 26, 53), 2.6)])
     g, esq = _grafo_de_mascara(y, dims1)
     m = g["metricas"]
+    radio_y = m["radio_promedio_mm"]      # se vuelve a mirar en la comprobación 6
     ok &= chequear("Y: 4 nodos, 1 bifurcación, 3 puntas, 3 aristas",
                    (m["num_nodos"], m["num_bifurcaciones"], m["num_puntas"], m["num_aristas"]) == (4, 1, 3, 3))
     ok &= chequear("Y: 1 componente, 0 ciclos", m["num_componentes"] == 1 && m["ciclos_independientes"] == 0)
@@ -1175,6 +1349,60 @@ function autoprueba_grafos()
         peor = max(peor, abs(dt[i, j, k] - mejor))
     end
     ok &= chequear("EDT = fuerza bruta con espaciado anisotrópico (peor diferencia $(peor))", peor < 1e-9)
+
+    # 6) Radio por volumen: tubos oblicuos de radio conocido, con rejilla isotrópica y con la del estudio real
+    #    (1,406 × 1,406 × 3,5 mm). Los errores esperados salen de docs/TestGraph/prototipo_radio.py sobre los MISMOS
+    #    fantomas: isotrópica ≤ 1,5 %, anisotrópica ≤ 2,1 % (la EDT: −2,5 a −4,4 % y −2,2 a −12,6 %).
+    dir_obl = (1.0, 0.6, 0.4)
+    casos_radio = [("1 mm", (1.0, 1.0, 1.0), 2.0, (0.23, -0.17, 0.31), 0.035),
+                   ("1 mm", (1.0, 1.0, 1.0), 3.0, (0.23, -0.17, 0.31), 0.035),
+                   ("1 mm", (1.0, 1.0, 1.0), 4.0, (0.23, -0.17, 0.31), 0.035),
+                   ("1,406×1,406×3,5 mm", (1.40625, 1.40625, 3.5), 3.0, (0.35, 0.2, 0.9), 0.05),
+                   ("1,406×1,406×3,5 mm", (1.40625, 1.40625, 3.5), 4.0, (0.35, 0.2, 0.9), 0.05),
+                   ("1,406×1,406×3,5 mm", (1.40625, 1.40625, 3.5), 5.0, (-0.5, 0.45, -1.2), 0.05)]
+    for (nombre, dims, Rv, desp, tol) in casos_radio
+        tubo = _tubo_oblicuo_mm(Rv, dims, dir_obl, desp)
+        gt, _ = _grafo_de_mascara(tubo, dims)
+        mt = gt["metricas"]
+        est = mt["radio_promedio_mm"]
+        err = est === nothing ? NaN : (est - Rv) / Rv
+        txt = est === nothing ? "sin valor" : "$(round(est, digits=3)) mm (error $(round(100 * err, digits=1)) %, tolerancia $(round(100 * tol, digits=1)) %)"
+        ok &= chequear("tubo oblicuo R = $(Rv) mm, vóxel $(nombre): 1 arista de punta a punta y radio $(txt)",
+                       mt["num_aristas"] == 1 && mt["num_puntas"] == 2 && est !== nothing && abs(err) < tol)
+    end
+    for (dims, Rv, desp) in (((1.0, 1.0, 1.0), 4.0, (0.23, -0.17, 0.31)), ((1.40625, 1.40625, 3.5), 4.0, (0.35, 0.2, 0.9)))
+        tubo = _tubo_oblicuo_mm(Rv, dims, dir_obl, desp)
+        dt_t = _transformada_distancia(tubo, dims)
+        esq_t = _esqueletizar_3d(tubo, dt_t)
+        vol_t = _volumen_celdas_esqueleto(tubo, esq_t, dims)
+        _, _, ars = _construir_grafo(esq_t, dt_t, dims; vol_celda=vol_t)
+        a = ars[argmax([x.longitud for x in ars])]
+        e_edt = abs(a.rad_long / a.longitud - Rv) / Rv
+        e_vol = abs(a.rad_vol_long / a.longitud - Rv) / Rv
+        ok &= chequear("R = 4 mm, vóxel $(dims[3] > 2 ? "anisotrópico" : "isotrópico"): error por volumen $(round(100 * e_vol, digits=1)) % < error de la EDT $(round(100 * e_edt, digits=1)) %",
+                       e_vol < e_edt)
+        ok &= chequear("las celdas reparten TODO el volumen de la máscara (suma = $(round(sum(vol_t), digits=1)) mm³)",
+                       abs(sum(vol_t) - count(tubo) * dims[1] * dims[2] * dims[3]) < 1e-6 * sum(vol_t))
+    end
+    ok &= chequear("Y de radios 3,2 / 2,6: radio medio por longitud entre las ramas, ≈ 2,87 (el verdadero ponderado es 2,79)",
+                   radio_y !== nothing && 2.70 < radio_y < 2.95)
+
+    # 7) Piezas del estimador de radio
+    barra = fill(true, 7, 1, 1)
+    semillas = zeros(Bool, 7, 1, 1)
+    semillas[1, 1, 1] = true
+    semillas[7, 1, 1] = true
+    vc = _volumen_celdas_esqueleto(barra, semillas, (2.0, 1.0, 1.0))
+    ok &= chequear("celdas: dos semillas en una barra de 7 vóxeles de 2 mm³ se reparten los 14 mm³ (4 + 3 vóxeles; el empate se queda con la primera), sin volumen en el resto",
+                   vc[1, 1, 1] == 8.0 && vc[7, 1, 1] == 6.0 && count(!=(0.0), vc) == 2)
+    pts_t = zeros(3, 22)
+    for t in 1:22
+        pts_t[3, t] = Float64(t - 1)
+    end
+    r_t, usa_t = _radio_por_volumen(pts_t, fill(pi * 9.0, 20), 3.0)
+    ok &= chequear("R = sqrt(V/(πL)): cilindro de radio 3 con 20 celdas de π·9 mm³ → 3 exacto (recortando 3 mm por extremo)", usa_t && abs(r_t - 3.0) < 1e-12)
+    r_t2, usa_t2 = _radio_por_volumen(pts_t, fill(pi * 9.0, 20), 11.0)
+    ok &= chequear("arista demasiado corta para recortar los extremos: se conserva el radio EDT (11,0)", !usa_t2 && r_t2 == 11.0)
 
     println(ok ? "✅ Autoprueba del análisis por grafos: todo en orden" : "❌ Autoprueba del análisis por grafos: HAY FALLOS")
     return ok
