@@ -11,7 +11,8 @@ using MRIReco
 using MedImages
 using ImageMorphology
 using CodecXz  # Para leer archivos .nii.gz comprimidos tengo entendido NIIfTI se comunica de manera nativa con esto, si es mas rapido modificar analisis radiomico
-
+using ImageTransformations
+using Interpolations
 """
 		detectar_tipo_archivo(filepath::String) -> Symbol
 
@@ -34,7 +35,7 @@ end
     leer_volumen_nifti(filepath::String) -> (Array{Float64, 3}, Tuple{Float64, Float64, Float64})
 lee el archivo y retorna el volumen 3D en Float64 y las dimensiones (x,y,z) del voxel 
 Lo hace a flujo todo, probare hacerlo asi en vez de lo que esta en el de radiomica, porque 
-crear muchos archivos temporales en el disco da�a el hardware, corregir si funciona bien hacerlo en flujo
+crear muchos archivos temporales en el disco da�a el hardware, corregir si funciona bien hacerlo en flujo
 """
 function leer_volumen_nifti(filepath::String)
     try
@@ -90,7 +91,7 @@ end
 ################################################################################################################
 # Pre Procesamiento 
 """
-Crea una m�scara binaria limpia del cuerpo/estructura eliminando 
+Crea una m�scara binaria limpia del cuerpo/estructura eliminando 
 el ruido del aire exterior.
 """
 function crear_mascara_tejido(volumen_normalizado, umbral=0.1)
@@ -105,4 +106,36 @@ function crear_mascara_tejido(volumen_normalizado, umbral=0.1)
     mascara_limpia = opening(mascara_limpia)
    
     return mascara_limpia
+end
+##################################################
+
+
+"""
+    resamplear_isotropico(img::MRIImage{T, 3}, target_spacing::NTuple{3, Float64}; mask::Union{BitArray, Nothing}=nothing)
+
+Re-muestrea el volumen MRI y opcionalmente su máscara a un tamaño de vóxel isotrópico objetivo (ej. (1.0, 1.0, 1.0) mm).
+"""
+function resamplear_isotropico(img::MRIImage{T, 3}, target_spacing::NTuple{3, Float64}; mask::Union{BitArray, Nothing}=nothing) where {T}
+    orig_size = size(img.data)
+    orig_spacing = img.spacing
+    
+    # 1. Calcular el nuevo tamaño de la matriz basado en la relación de espaciados
+    new_size = map(orig_size, orig_spacing, target_spacing) do sz, o_sp, t_sp
+        round(Int, sz * (o_sp / t_sp))
+    end
+    
+    # 2. Resmuestreo de la imagen MRI usando interpolación suave por defecto en imresize
+    datos_resampleados = imresize(img.data, new_size)
+    
+    # Creamos la nueva estructura MRIImage con el nuevo espaciado objetivo
+    img_resampleada = MRIImage(Float64.(datos_resampleados), target_spacing, img.filepath)
+    
+    if mask !== nothing
+        # 3. Regla de oro: La máscara binaria se resamplea estrictamente con vecino más cercano (Constant()) 
+        # para evitar suavizar los bordes y convertir los ceros/unos en valores decimales.
+        mascara_resampleada = imresize(float.(mask), new_size, method = Constant()) .> 0.5
+        return img_resampleada, BitArray(mascara_resampleada)
+    else
+        return img_resampleada
+    end
 end
