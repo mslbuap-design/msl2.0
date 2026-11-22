@@ -1,6 +1,6 @@
 # API de Pacientes — Contrato para el frontend
 
-> Módulo **Repositorio histórico de pacientes** de MSL Process (Fase 2, verificada en Docker el 2026-11-22).
+> Módulo **Repositorio histórico de pacientes** de MSL Process (Fase 2 + Bloque F2-4 de subida fragmentada, verificados en Docker el 2026-11-22).
 > Jerarquía: **Paciente → Estudio → Archivo médico**.
 > Fuente de verdad del backend: `backend/src/handlers/pacientes.jl` y `backend/database/pacientes_queries.jl`.
 
@@ -46,6 +46,8 @@ Access-Control-Allow-Headers: Content-Type
 - `PATCH` **no** está en la lista de métodos permitidos: el navegador bloquearía el *preflight*. Por eso la edición se hace con **`PUT` con semántica parcial** (ver §4): solo se modifican los campos que envías.
 - Solo se admite el header personalizado `Content-Type`. No envíes otros headers (`Authorization`, `X-...`) o el preflight fallará.
 - Con `FormData` **no** pongas `Content-Type` a mano: el navegador lo genera con el `boundary` correcto.
+- La subida fragmentada (§5.17) envía cada parte con `PUT` y `Content-Type: application/octet-stream`: cumple el CORS actual (no usa headers personalizados).
+- Las descargas por rango (§5.14) usan el header `Range`. Los navegadores lo tratan como header "seguro" para rangos simples (`bytes=a-b`); si alguno hiciera *preflight* por él, el backend tendría que añadir `Range` a `Access-Control-Allow-Headers`.
 
 ### Fechas
 
@@ -75,7 +77,11 @@ Access-Control-Allow-Headers: Content-Type
 | 404 | `ARCHIVO_NO_DISPONIBLE` | El archivo está registrado pero falta en el disco del servidor (solo en descarga) |
 | 409 | `PACIENTE_DUPLICADO` | Ya existe un paciente con ese código (**sin distinguir mayúsculas**: `pac-1` = `PAC-1`) |
 | 409 | `ARCHIVO_DUPLICADO` | Ya existe un archivo con ese nombre en el estudio, o el nombre viene repetido en la misma subida |
-| 413 | `ARCHIVO_MUY_GRANDE` | La subida supera `max_upload_mb` (por defecto 500 MB en total) |
+| 413 | `ARCHIVO_MUY_GRANDE` | La subida directa supera `max_upload_mb` (por defecto 500 MB en total), o la fragmentada supera `subida_fragmentada.max_upload_mb` (5120 MB) |
+| 404 | `SUBIDA_NO_ENCONTRADA` | La subida fragmentada no existe, ya se completó, se canceló o expiró (2 h sin actividad) |
+| 400 | `SUBIDA_INCOMPLETA` | `completar` antes de enviar todas las partes (trae `partes_faltantes`). **No** cancela la subida |
+| 400 / 413 | `PARTE_INVALIDA` | `indice` ausente o fuera de rango, o la parte no mide lo esperado (400); la parte supera `tamano_parte_bytes` (413) |
+| 416 | `RANGO_INVALIDO` | Header `Range` mal formado, con varios rangos o fuera del archivo |
 | 500 | `ERROR_INTERNO` | Fallo del servidor. No incluye detalles; se registran en el log del backend |
 
 Una ruta que no existe (o un método no registrado, como `PATCH`) responde **404** `{"success": false, "error": "Ruta no encontrada", "path": "..."}` **sin** `codigo_error`.
@@ -239,9 +245,13 @@ Resumen:
 | PUT | `/api/estudios/:id` | Editar estudio (parcial) |
 | DELETE | `/api/estudios/:id` | Borrar estudio (cascada) |
 | GET | `/api/estudios/:id/archivos` | Archivos del estudio con filtros |
-| POST | `/api/estudios/:id/archivos` | Subir archivos (multipart) |
+| POST | `/api/estudios/:id/archivos` | Subir archivos (multipart, < 100 MB recomendado) |
+| POST | `/api/estudios/:id/subidas` | Iniciar subida fragmentada (≥ 100 MB) |
+| PUT | `/api/subidas/:id_subida/parte?indice=N` | Enviar una parte |
+| POST | `/api/subidas/:id_subida/completar` | Terminar la subida fragmentada |
+| DELETE | `/api/subidas/:id_subida` | Cancelar la subida fragmentada |
 | GET | `/api/archivos/:id` | Metadatos de un archivo |
-| GET | `/api/archivos/:id/descarga` | Descargar bytes |
+| GET | `/api/archivos/:id/descarga` | Descargar bytes (admite `Range`) |
 | PUT | `/api/archivos/:id` | Editar metadatos (parcial) |
 | DELETE | `/api/archivos/:id` | Borrar archivo |
 
@@ -263,9 +273,19 @@ Cárgalo al iniciar la vista para poblar selects, el `accept` del `<input type="
     { "formato": "PDF",   "extensiones": [".pdf"] }
   ],
   "max_upload_mb": 500,
-  "paginacion": { "limite_defecto": 20, "limite_maximo": 100 }
+  "paginacion": { "limite_defecto": 20, "limite_maximo": 100 },
+  "subida_fragmentada": {
+    "tamano_parte_mb": 25,
+    "tamano_parte_bytes": 26214400,
+    "max_upload_mb": 5120,
+    "umbral_recomendado_mb": 100
+  }
 }
 ```
+
+- `max_upload_mb` (raíz): límite de la subida **directa** multipart (§5.12).
+- `subida_fragmentada.umbral_recomendado_mb`: a partir de este tamaño usa la subida fragmentada (§5.17).
+- `subida_fragmentada.max_upload_mb`: tamaño máximo de **un** archivo fragmentado.
 
 ```js
 const cat = await api("/api/pacientes/catalogos");
@@ -458,6 +478,8 @@ const { archivos } = await api(`/api/estudios/${idEstudio}/archivos`, { method: 
 
 Para mostrar progreso de subida usa `XMLHttpRequest` (`xhr.upload.onprogress`); `fetch` no lo expone.
 
+> Para archivos **≥ 100 MB** (`subida_fragmentada.umbral_recomendado_mb`) usa la subida fragmentada (§5.17): el servidor no tiene que recibir cientos de MB en una sola petición y el progreso sale gratis por partes.
+
 ### 5.13 `GET /api/archivos/:id`
 
 **200** `{ "success": true, "archivo": Archivo }`. 404 si no existe.
@@ -470,14 +492,38 @@ Devuelve los **bytes exactos** del archivo subido (no JSON). Headers:
 |---|---|
 | `Content-Type` | `application/gzip` (`.nii.gz`), `application/dicom`, `application/zip`, `application/pdf`, `image/png`, `text/csv; charset=utf-8`, tipos de Excel, o `application/octet-stream` (`.nii`) |
 | `Content-Disposition` | `attachment; filename="<ascii>"; filename*=UTF-8''<nombre codificado>` |
-| `Content-Length` | Tamaño en bytes |
+| `Content-Length` | Tamaño en bytes (del bloque enviado) |
+| `Accept-Ranges` | `bytes` (el servidor admite descargas por rango) |
+| `Content-Range` | Solo en `206`: `bytes <inicio>-<fin>/<total>` |
 | `Cache-Control` | `no-store` (datos médicos: no se cachean) |
 | `X-Content-Type-Options` | `nosniff` |
-| `Access-Control-Expose-Headers` | `Content-Disposition, Content-Length` (para que `fetch` pueda leerlos desde otro origen) |
+| `Access-Control-Expose-Headers` | `Content-Disposition, Content-Length, Content-Range, Accept-Ranges` (para que `fetch` pueda leerlos desde otro origen) |
 
-Errores (en JSON): 400 `ID_INVALIDO`, 404 `NO_ENCONTRADO`, 404 `ARCHIVO_NO_DISPONIBLE` (registrado pero ausente del disco). Comprueba `r.ok` antes de tratar el body como binario.
+Errores (en JSON): 400 `ID_INVALIDO`, 404 `NO_ENCONTRADO`, 404 `ARCHIVO_NO_DISPONIBLE` (registrado pero ausente del disco), 416 `RANGO_INVALIDO`. Comprueba `r.ok` antes de tratar el body como binario.
 
-⚠️ **Límite en RAM:** el servidor todavía no hace *streaming*: carga el archivo completo en memoria antes de enviarlo (hasta 500 MB). Evita lanzar muchas descargas grandes en paralelo.
+**Descarga por rango (`Range`)** — un único rango por petición:
+
+| Header enviado | Respuesta |
+|---|---|
+| *(sin `Range`)* | **200** con el archivo completo |
+| `Range: bytes=0-1023` | **206**, bytes 0 a 1023 inclusive (1024 bytes) |
+| `Range: bytes=1048576-` | **206**, desde el byte 1048576 hasta el final |
+| `Range: bytes=-100` | **206**, los últimos 100 bytes |
+| Fin mayor que el archivo (`bytes=0-999999999`) | **206**, recortado al último byte |
+| Inicio ≥ tamaño, varios rangos (`bytes=0-1,5-9`) o formato inválido | **416** `RANGO_INVALIDO` + `Content-Range: bytes */<total>` |
+
+```js
+// Leer solo la cabecera NIfTI (los primeros 352 bytes) sin bajar el archivo entero.
+const r = await fetch(`${API}${archivo.url_descarga}`, { headers: { Range: "bytes=0-351" } });
+if (r.status !== 206) throw await r.json();
+const cabecera = new Uint8Array(await r.arrayBuffer());
+```
+
+```bash
+curl.exe -H "Range: bytes=0-1023" -o primeros_1k.bin http://localhost:8000/api/archivos/1/descarga
+```
+
+⚠️ **Límite en RAM:** el servidor todavía no hace *streaming*: carga en memoria el bloque pedido antes de enviarlo (el archivo entero si no hay `Range`). Las lecturas de **≥ 100 MiB se atienden de una en una**: una segunda descarga grande espera su turno (tarda más, no falla). Para archivos de varios GB que solo necesitas procesar en el navegador, pide trozos con `Range` en lugar del archivo completo.
 
 Opción A — enlace directo (el navegador gestiona la descarga y la memoria):
 
@@ -519,6 +565,157 @@ Borra el registro y el archivo físico.
 { "success": true, "eliminado": true, "id_archivo": 2, "limpieza_disco": true }
 ```
 
+### 5.17 Subida fragmentada (archivos de 100 MB a 5 GB)
+
+El archivo se corta en el navegador con `file.slice()` en partes de `tamano_parte_bytes` (25 MB) y cada parte viaja en su propia petición. Flujo:
+
+```
+POST /api/estudios/:id/subidas          → { subida: { id_subida, total_partes, tamano_parte_bytes, ... } }
+PUT  /api/subidas/:id_subida/parte?indice=0..N-1   (bytes crudos, una vez por parte)
+POST /api/subidas/:id_subida/completar  → { archivo: Archivo }
+DELETE /api/subidas/:id_subida          (opcional: cancelar)
+```
+
+- Las partes se pueden enviar **en cualquier orden** y **reintentar** (reenviar la misma parte no la duplica).
+- La sesión **expira tras 2 h sin actividad** (cada parte renueva el plazo; `expira_en` te dice hasta cuándo). Al expirar → 404 `SUBIDA_NO_ENCONTRADA`; hay que empezar de nuevo.
+- El servidor procesa como máximo **4 partes a la vez** (entre todas las subidas). Envía las partes **una tras otra** (o 2 en paralelo como mucho).
+- El archivo **no** aparece en el estudio hasta que `completar` devuelve 201.
+
+#### 5.17.1 `POST /api/estudios/:id/subidas`
+
+Body JSON:
+
+| Campo | Obligatorio | Reglas |
+|---|---|---|
+| `nombre_original` | Sí | Mismas reglas de nombre y extensión que la subida directa (§5.12) |
+| `tamano_bytes` | Sí | Entero `1 … 5368709120` (`file.size`). Mayor → 413 `ARCHIVO_MUY_GRANDE` |
+| `tipo_archivo` | No | Del catálogo; por defecto `imagen` |
+| `metadatos` | No | Objeto JSON; se guarda como `metadatos_extra` |
+
+Respuesta **201**:
+
+```json
+{
+  "success": true,
+  "subida": {
+    "id_subida": "27f78d3d84a2b25896a69827856aaed2",
+    "id_estudio": 7,
+    "nombre_original": "t1_basal.nii.gz",
+    "formato": "NIfTI",
+    "tipo_archivo": "imagen",
+    "tamano_bytes": 27262976,
+    "tamano_parte_bytes": 26214400,
+    "total_partes": 2,
+    "expira_en": "2026-11-22T09:05:06Z"
+  }
+}
+```
+
+Errores: 400 `ID_INVALIDO` / `DATOS_INVALIDOS`, 404 `NO_ENCONTRADO` (estudio), **409 `ARCHIVO_DUPLICADO`** si el estudio ya tiene un archivo con ese nombre (sin distinguir mayúsculas; se avisa aquí para no subir GB en vano), 413 `ARCHIVO_MUY_GRANDE`.
+
+#### 5.17.2 `PUT /api/subidas/:id_subida/parte?indice=N`
+
+- Body: los bytes crudos de la parte, con `Content-Type: application/octet-stream`.
+- `indice` va de `0` a `total_partes - 1`. La parte `i` es `file.slice(i * tamano_parte_bytes, (i + 1) * tamano_parte_bytes)`.
+- Todas las partes miden exactamente `tamano_parte_bytes`, salvo la última, que lleva el resto.
+
+Respuesta **200**:
+
+```json
+{ "success": true, "id_subida": "27f7…", "indice": 1, "partes_recibidas": 1, "total_partes": 2, "expira_en": "2026-11-22T09:05:06Z" }
+```
+
+Errores: 404 `SUBIDA_NO_ENCONTRADA`, 400 `PARTE_INVALIDA` (falta `indice`, está fuera de rango, o la parte no mide lo esperado), 413 `PARTE_INVALIDA` (parte mayor que `tamano_parte_bytes`).
+
+```bash
+curl.exe -X PUT "http://localhost:8000/api/subidas/<id_subida>/parte?indice=0" -H "Content-Type: application/octet-stream" --data-binary "@parte0.bin"
+```
+
+#### 5.17.3 `POST /api/subidas/:id_subida/completar`
+
+Sin body. Respuesta **201** `{ "success": true, "archivo": Archivo }` (con `url_descarga` y `tamano_bytes`, igual que §3).
+
+Errores:
+
+- 400 `SUBIDA_INCOMPLETA` (**no** cancela la subida: envía lo que falta y vuelve a llamar):
+  ```json
+  { "success": false, "codigo_error": "SUBIDA_INCOMPLETA", "error": "Faltan 1 de 2 partes",
+    "partes_faltantes": [0], "partes_recibidas": 1, "total_partes": 2 }
+  ```
+  `partes_faltantes` lista como mucho 100 índices.
+- 409 `ARCHIVO_DUPLICADO`: otro usuario completó antes un archivo con el mismo nombre. **La subida se descarta** (hay que renombrar y empezar de nuevo).
+- 404 `SUBIDA_NO_ENCONTRADA` (ya completada, cancelada o expirada) o `NO_ENCONTRADO` (el estudio se borró mientras subías).
+
+Salvo `SUBIDA_INCOMPLETA`, cualquier respuesta de `completar` **cierra** la sesión.
+
+#### 5.17.4 `DELETE /api/subidas/:id_subida`
+
+Cancela la subida y borra los datos recibidos. **200** `{ "success": true, "cancelada": true, "id_subida": "…" }`; 404 `SUBIDA_NO_ENCONTRADA` si ya no existe.
+
+#### 5.17.5 Función lista para copiar: subida directa o fragmentada según el tamaño
+
+Usa la constante `API` de §1. Elige sola el modo, reintenta cada parte hasta 3 veces ante errores de red o 5xx, informa el progreso (0–100) y cancela la subida en el servidor si algo falla.
+
+```js
+export async function subirArchivo(idEstudio, file, { tipoArchivo = "imagen", metadatos = null, onProgress = () => {} } = {}) {
+  const pedir = async (ruta, opciones) => {
+    const r = await fetch(`${API}${ruta}`, opciones);
+    const d = await r.json();
+    if (!d.success) throw Object.assign(new Error(d.error), { status: r.status, codigo: d.codigo_error });
+    return d;
+  };
+  const { subida_fragmentada: sf } = await pedir("/api/pacientes/catalogos");
+  if (file.size < sf.umbral_recomendado_mb * 1024 * 1024) {             // --- directa ---
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("tipo_archivo", tipoArchivo);
+    if (metadatos) fd.append("metadatos", JSON.stringify(metadatos));
+    const { archivos } = await pedir(`/api/estudios/${idEstudio}/archivos`, { method: "POST", body: fd });
+    onProgress(100);
+    return archivos[0];
+  }
+  const { subida } = await pedir(`/api/estudios/${idEstudio}/subidas`, {   // --- fragmentada ---
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nombre_original: file.name, tamano_bytes: file.size, tipo_archivo: tipoArchivo, metadatos }),
+  });
+  const base = `/api/subidas/${subida.id_subida}`;
+  try {
+    for (let i = 0; i < subida.total_partes; i++) {
+      const parte = file.slice(i * subida.tamano_parte_bytes, (i + 1) * subida.tamano_parte_bytes);
+      for (let intento = 1; ; intento++) {
+        try {
+          await pedir(`${base}/parte?indice=${i}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: parte });
+          break;
+        } catch (e) { if (intento >= 3 || (e.status && e.status < 500)) throw e; }   // 4xx: no reintentar
+      }
+      onProgress(Math.round(((i + 1) / subida.total_partes) * 99));        // el 100 % llega al completar
+    }
+    const { archivo } = await pedir(`${base}/completar`, { method: "POST" });
+    onProgress(100);
+    return archivo;
+  } catch (e) {
+    fetch(`${API}${base}`, { method: "DELETE" }).catch(() => {});        // libera el temporal (si aún existe)
+    throw e;
+  }
+}
+```
+
+Uso:
+
+```js
+try {
+  const archivo = await subirArchivo(idEstudio, input.files[0], {
+    metadatos: { secuencia: "T1" },
+    onProgress: (p) => setProgreso(p),
+  });
+} catch (e) {
+  if (e.codigo === "ARCHIVO_DUPLICADO") mostrarError("Ya existe un archivo con ese nombre en el estudio");
+  else mostrarError(e.message);
+}
+```
+
+> En la rama directa el progreso salta de 0 a 100 porque `fetch` no informa del avance de la subida. Si lo necesitas para archivos medianos, cambia esa rama por `XMLHttpRequest` con `xhr.upload.onprogress`.
+
 ---
 
 ## 6. Autenticación (pendiente)
@@ -535,5 +732,5 @@ Borra el registro y el archivo físico.
 1. Al montar: `GET /api/pacientes/catalogos` y `GET /api/pacientes?limite=20`.
 2. Buscar: `GET /api/pacientes?buscar=<texto>&limite=20&desplazamiento=0` (con *debounce*).
 3. Abrir un paciente: `GET /api/pacientes/:id` → pinta estudios y archivos anidados.
-4. Nuevo estudio: `POST /api/pacientes/:id/estudios` → luego subir archivos a `POST /api/estudios/:id_estudio/archivos`.
+4. Nuevo estudio: `POST /api/pacientes/:id/estudios` → luego subir archivos con `subirArchivo()` (§5.17.5), que usa `POST /api/estudios/:id_estudio/archivos` para archivos < 100 MB y la subida fragmentada para los mayores.
 5. Tras cualquier `POST`/`PUT`/`DELETE`, usa el recurso devuelto o recarga el detalle del paciente.

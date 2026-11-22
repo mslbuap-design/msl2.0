@@ -1,6 +1,7 @@
 # ==============================================================================
 # Handlers del repositorio histórico de pacientes
-# (CRUD de pacientes/estudios · subida atómica de archivos médicos)
+# (CRUD de pacientes/estudios · subida atómica de archivos médicos ·
+#  subida fragmentada para archivos de varios GB · descarga con `Range`)
 # ==============================================================================
 #
 # Jerarquía: Paciente -> Estudio -> Archivo médico (ver SPEC.md).
@@ -796,6 +797,467 @@ function _procesar_subida(req, id_estudio::Int)
 end
 
 # =========================================================
+# SUBIDA FRAGMENTADA (chunked upload) — archivos de 500 MB a varios GB
+# =========================================================
+#
+# Flujo:
+#   1. POST   /api/estudios/:id/subidas            → abre sesión + `.partial` vacío
+#   2. PUT    /api/subidas/:id_subida/parte?indice=N (una vez por parte, en
+#             cualquier orden; reintentar una parte es seguro)
+#   3. POST   /api/subidas/:id_subida/completar    → registra en BD y publica con `mv`
+#   (DELETE   /api/subidas/:id_subida cancela)
+#
+# Cada petición trae como mucho CHUNK_SIZE_BYTES, así la RAM por petición
+# queda acotada aunque el archivo pese varios GB. HTTP.jl ya tiene el body
+# completo en `req.body` cuando llega al handler; por eso el tamaño de parte
+# es lo que de verdad limita la memoria.
+#
+# Concurrencia (con `julia -t auto` cada request corre en su propio hilo):
+#   - `_SUBIDAS_LOCK` protege el Dict global de sesiones (acceso breve).
+#   - `sesion.lock` serializa las operaciones sobre UNA sesión (escribir parte,
+#     completar, cancelar, expirar).
+#   - Orden de locks: si se necesitan ambos, SIEMPRE primero el de la sesión y
+#     después el global. Nunca al revés → no hay interbloqueos (deadlocks).
+
+import Random   # stdlib: `RandomDevice` entrega bytes aleatorios del sistema operativo
+
+const _BYTES_POR_MB = 1024 * 1024
+
+# Tamaño de cada parte (25 MB por defecto). Configurable con MSL_CHUNK_SIZE_MB.
+const CHUNK_SIZE_BYTES = parse(Int, get(ENV, "MSL_CHUNK_SIZE_MB", "25")) * 1024 * 1024
+CHUNK_SIZE_BYTES > 0 || error("MSL_CHUNK_SIZE_MB debe ser un entero positivo")
+
+# Tamaño máximo de UN archivo fragmentado (5 GB). `Int64` explícito: el valor
+# no cabría en un entero de 32 bits.
+const MAX_CHUNKED_UPLOAD_BYTES =
+    parse(Int64, get(ENV, "MSL_MAX_CHUNKED_UPLOAD_MB", "5120")) * Int64(1024 * 1024)
+
+# Como mucho 4 partes escribiéndose a la vez (≈ 100 MB de partes en proceso).
+const CHUNK_UPLOAD_SEMAPHORE = Base.Semaphore(4)
+
+# Una sola lectura grande (>= 100 MiB) a la vez: dos descargas de ~1 GB en
+# paralelo podrían tumbar un contenedor de 4 GB.
+const LARGE_DOWNLOAD_SEMAPHORE = Base.Semaphore(1)
+const UMBRAL_DESCARGA_GRANDE_BYTES = 100 * _BYTES_POR_MB
+
+# A partir de este tamaño el frontend debería usar la subida fragmentada.
+const UMBRAL_SUBIDA_FRAGMENTADA_MB = 100
+
+# Una sesión expira tras 2 h SIN actividad (cada parte recibida renueva el plazo).
+const EXPIRACION_SUBIDA = Dates.Hour(2)
+
+const _REGEX_ID_SUBIDA = r"^[0-9a-f]{32}$"
+
+# Formato ISO-8601 UTC con `Z`, igual que el resto de la API.
+const _FORMATO_EXPIRA = Dates.DateFormat("yyyy-mm-dd\\THH:MM:SS")
+
+"""
+Estado de una subida fragmentada en curso. Es `mutable struct` porque
+algunos campos cambian (`expira`, `activa`); los marcados con `const`
+(Julia ≥ 1.8) no se pueden reasignar después de crear la sesión. Ojo:
+`recibidas` es `const` (siempre el mismo vector), pero su CONTENIDO sí cambia.
+Vive solo en memoria: si el servidor se reinicia, las sesiones se pierden y
+sus `.partial` se borran por antigüedad (ver `_limpiar_subidas_vencidas!`).
+"""
+mutable struct SesionSubida
+    const id_subida::String
+    const id_estudio::Int
+    const nombre_original::String
+    const formato::String
+    const tipo_archivo::String
+    const metadatos::Any                # objeto JSON o `nothing`
+    const tamano_bytes::Int64
+    const total_partes::Int
+    const ruta_tmp::String
+    const recibidas::BitVector          # recibidas[i] == true → llegó la parte i-1
+    const lock::ReentrantLock
+    expira::Dates.DateTime              # UTC
+    activa::Bool                        # false tras completar/cancelar/expirar
+end
+
+const _SUBIDAS_ACTIVAS = Dict{String, SesionSubida}()
+const _SUBIDAS_LOCK = ReentrantLock()
+
+# Carpeta temporal DENTRO del mismo volumen que los archivos finales: así
+# `mv` es un simple renombrado atómico (no una copia de 1 GB).
+_carpeta_tmp_subidas() = joinpath(PROJECTS_DIR, "_pacientes", "_tmp_subidas")
+
+"128 bits aleatorios del sistema operativo en hexadecimal (32 caracteres): imposible de adivinar."
+_nuevo_id_subida() = bytes2hex(rand(Random.RandomDevice(), UInt8, 16))
+
+_ahora_utc() = Dates.now(Dates.UTC)
+_vencida(s::SesionSubida) = _ahora_utc() > s.expira
+_expira_texto(s::SesionSubida) = Dates.format(s.expira, _FORMATO_EXPIRA) * "Z"
+
+"""
+Bytes que DEBE traer la parte `indice` (base 0): todas miden
+`CHUNK_SIZE_BYTES` salvo la última, que lleva el residuo exacto.
+"""
+function _tamano_esperado_parte(s::SesionSubida, indice::Integer)
+    indice < s.total_partes - 1 && return CHUNK_SIZE_BYTES
+    return Int(s.tamano_bytes - Int64(s.total_partes - 1) * Int64(CHUNK_SIZE_BYTES))
+end
+
+"""
+Bytes crudos del body SIN copiarlos cuando es posible. En la versión de
+HTTP.jl instalada `req.body` no es un `Vector{UInt8}` sino un
+`HTTP.BytesBody` (envoltorio con campos `data` y `next_index`); su
+documentación permite "tomar prestado" `view(data, next_index:end)` para
+solo leer. `view` crea una ventana sobre el vector original (sin copiar los
+25 MB). Para cualquier otro tipo de body (p.ej. `EmptyBody`), `copy`
+devuelve un `Vector{UInt8}`.
+"""
+function _bytes_del_body(body)
+    body isa AbstractVector{UInt8} && return body
+    if hasproperty(body, :data) && hasproperty(body, :next_index) &&
+       body.data isa AbstractVector{UInt8}
+        return view(body.data, body.next_index:length(body.data))
+    end
+    return copy(body)
+end
+
+_subida_no_encontrada() = _error_api(404, "SUBIDA_NO_ENCONTRADA",
+    "La subida no existe, ya terminó, fue cancelada o expiró (2 h sin actividad)")
+
+"""
+Busca una sesión por su id (tomando el lock global solo un instante).
+Devuelve la sesión o `nothing` si el id tiene formato inválido, no existe o
+ya venció (`incluir_vencidas=true` la devuelve igual, para poder cancelarla).
+`lock(f, l)` ejecuta `f()` con el lock tomado y lo libera aunque haya error.
+"""
+function _buscar_sesion(id_texto::AbstractString; incluir_vencidas::Bool=false)
+    occursin(_REGEX_ID_SUBIDA, id_texto) || return nothing
+    s = lock(() -> get(_SUBIDAS_ACTIVAS, String(id_texto), nothing), _SUBIDAS_LOCK)
+    isnothing(s) && return nothing
+    (!incluir_vencidas && _vencida(s)) && return nothing
+    return s
+end
+
+"""
+Cierra la sesión: la marca inactiva, la quita del Dict global y borra su
+`.partial` (si ya se movió, `rm(force=true)` simplemente no hace nada).
+Debe llamarse con `s.lock` YA tomado. Es idempotente.
+"""
+function _cerrar_sesion!(s::SesionSubida)
+    s.activa = false
+    lock(() -> delete!(_SUBIDAS_ACTIVAS, s.id_subida), _SUBIDAS_LOCK)
+    _borrar_archivos((s.ruta_tmp,))
+    return nothing
+end
+
+"""
+Limpieza "perezosa" (se ejecuta al iniciar cada subida nueva):
+1. Cierra las sesiones vencidas y borra sus `.partial`.
+2. Borra `.partial` huérfanos (sin sesión en memoria, p.ej. tras reiniciar el
+   servidor) cuya última modificación tenga más de 2 h.
+Nunca lanza error: un fallo aquí no debe impedir iniciar una subida.
+"""
+function _limpiar_subidas_vencidas!()
+    try
+        # Paso 1a: solo LEER el Dict con el lock global...
+        candidatas = lock(_SUBIDAS_LOCK) do
+            [s for s in values(_SUBIDAS_ACTIVAS) if _vencida(s)]
+        end
+        # Paso 1b: ...y cerrar cada una con SU lock (respeta el orden sesión → global).
+        # Se vuelve a comprobar: una parte pudo renovar el plazo mientras tanto.
+        for s in candidatas
+            lock(s.lock) do
+                (s.activa && _vencida(s)) && _cerrar_sesion!(s)
+            end
+        end
+
+        # Paso 2: huérfanos en disco.
+        carpeta = _carpeta_tmp_subidas()
+        isdir(carpeta) || return nothing
+        activos = lock(() -> Set(keys(_SUBIDAS_ACTIVAS)), _SUBIDAS_LOCK)
+        limite = time() - Dates.value(Dates.Second(EXPIRACION_SUBIDA))   # `time()` = segundos Unix
+        for nombre in readdir(carpeta)
+            endswith(nombre, ".partial") || continue
+            chop(nombre; tail=length(".partial")) in activos && continue
+            ruta = joinpath(carpeta, nombre)
+            mtime(ruta) < limite && _borrar_archivos((ruta,))
+        end
+    catch e
+        @warn "Fallo limpiando subidas vencidas" exception = e
+    end
+    return nothing
+end
+
+"Forma pública de la sesión (nunca expone `ruta_tmp`)."
+function _sesion_publica(s::SesionSubida)
+    return Dict{String, Any}(
+        "id_subida"          => s.id_subida,
+        "id_estudio"         => s.id_estudio,
+        "nombre_original"    => s.nombre_original,
+        "formato"            => s.formato,
+        "tipo_archivo"       => s.tipo_archivo,
+        "tamano_bytes"       => s.tamano_bytes,
+        "tamano_parte_bytes" => CHUNK_SIZE_BYTES,
+        "total_partes"       => s.total_partes,
+        "expira_en"          => _expira_texto(s)
+    )
+end
+
+# =========================================================
+# POST /api/estudios/:id/subidas
+# body JSON: {nombre_original, tamano_bytes, tipo_archivo?, metadatos?}
+# =========================================================
+function handler_iniciar_subida(req, params)
+    id_estudio = _id_valido(params["id"])
+    isnothing(id_estudio) && return _error_api(400, "ID_INVALIDO", "id de estudio inválido")
+
+    body, err = _leer_objeto_json(req)
+    isnothing(err) || return err
+
+    # --- nombre_original (obligatorio, mismas reglas que la subida directa) ---
+    nombre_crudo = get(body, "nombre_original", nothing)
+    (nombre_crudo isa AbstractString && !isempty(nombre_crudo)) ||
+        return _error_api(400, "DATOS_INVALIDOS", "'nombre_original' es obligatorio")
+    nombre, err = _sanear_nombre_archivo(nombre_crudo)
+    isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+    formato = _detectar_formato(nombre)
+    isnothing(formato) && return _error_api(400, "DATOS_INVALIDOS",
+        "Extensión no permitida en '$nombre'. Usa: " * join(first.(_FORMATOS_POR_EXTENSION), ", "))
+
+    # --- tamano_bytes (entero 1..MAX) ---
+    # En Julia `Bool <: Integer` (`true == 1`), por eso se excluye a mano.
+    tamano = get(body, "tamano_bytes", nothing)
+    (tamano isa Integer && !(tamano isa Bool) && tamano >= 1) ||
+        return _error_api(400, "DATOS_INVALIDOS", "'tamano_bytes' debe ser un entero >= 1")
+    tamano > MAX_CHUNKED_UPLOAD_BYTES && return _error_api(413, "ARCHIVO_MUY_GRANDE",
+        "El archivo excede el límite de $(MAX_CHUNKED_UPLOAD_BYTES ÷ _BYTES_POR_MB) MB")
+    tamano = Int64(tamano)
+
+    # --- tipo_archivo (opcional, por defecto "imagen") ---
+    tipo_crudo = get(body, "tipo_archivo", nothing)
+    (isnothing(tipo_crudo) || tipo_crudo isa AbstractString) ||
+        return _error_api(400, "DATOS_INVALIDOS", "'tipo_archivo' debe ser texto")
+    tipo_archivo = (isnothing(tipo_crudo) || isempty(strip(tipo_crudo))) ? "imagen" :
+                   lowercase(strip(tipo_crudo))
+    tipo_archivo in TIPOS_ARCHIVO_PERMITIDOS || return _error_api(400, "DATOS_INVALIDOS",
+        "'tipo_archivo' inválido. Permitidos: $(join(TIPOS_ARCHIVO_PERMITIDOS, ", "))")
+
+    # --- metadatos (opcional, objeto JSON) ---
+    metadatos = get(body, "metadatos", nothing)
+    (isnothing(metadatos) || metadatos isa AbstractDict) ||
+        return _error_api(400, "DATOS_INVALIDOS", "'metadatos' debe ser un objeto JSON ({...})")
+
+    try
+        isnothing(obtener_estudio_con_paciente(DB_CONN, id_estudio)) &&
+            return _error_api(404, "NO_ENCONTRADO", "Estudio no encontrado")
+        # Pre-chequeo NO autoritativo (el árbitro real es el UNIQUE en
+        # `completar`): evita que el usuario suba 1 GB para recibir un 409 al final.
+        nombre_min = lowercase(nombre)
+        any(a -> lowercase(a["nombre_original"]) == nombre_min,
+            listar_archivos_estudio(DB_CONN, id_estudio)) &&
+            return _error_api(409, "ARCHIVO_DUPLICADO",
+                "Ya existe en este estudio un archivo '$nombre' (no se sobrescribe)")
+    catch e
+        return _error_interno("Error validando estudio $id_estudio para subida fragmentada", e)
+    end
+
+    _limpiar_subidas_vencidas!()
+
+    id_subida = _nuevo_id_subida()
+    ruta_tmp = joinpath(_carpeta_tmp_subidas(), "$(id_subida).partial")
+    try
+        mkpath(_carpeta_tmp_subidas())
+        close(open(ruta_tmp, "w"))   # crea el archivo vacío (las partes lo irán llenando)
+    catch e
+        _borrar_archivos((ruta_tmp,))
+        return _error_interno("No se pudo crear el temporal de la subida", e)
+    end
+
+    # `cld` = división entera redondeando hacia arriba: 26 MB / 25 MB → 2 partes.
+    total_partes = Int(cld(tamano, CHUNK_SIZE_BYTES))
+    s = SesionSubida(id_subida, id_estudio, nombre, formato, tipo_archivo, metadatos,
+                     tamano, total_partes, ruta_tmp, falses(total_partes),
+                     ReentrantLock(), _ahora_utc() + EXPIRACION_SUBIDA, true)
+    lock(() -> (_SUBIDAS_ACTIVAS[id_subida] = s), _SUBIDAS_LOCK)
+
+    println("⏫ Subida fragmentada iniciada: '$nombre' ($tamano bytes, $total_partes partes) → estudio $id_estudio")
+    return json_response(201, Dict("success" => true, "subida" => _sesion_publica(s)))
+end
+
+# =========================================================
+# PUT /api/subidas/:id_subida/parte?indice=N
+# body: bytes crudos (Content-Type: application/octet-stream)
+# =========================================================
+function handler_subir_parte(req, params)
+    s = _buscar_sesion(params["id_subida"])
+    isnothing(s) && return _subida_no_encontrada()
+
+    query, err = _leer_query(req)
+    isnothing(err) || return err
+    haskey(query, "indice") ||
+        return _error_api(400, "PARTE_INVALIDA", "Falta el parámetro '?indice=N'")
+    indice, err = _entero_query(query, "indice", 0, 0, s.total_partes - 1)
+    isnothing(err) || return _error_api(400, "PARTE_INVALIDA", err)
+
+    # Validaciones de tamaño ANTES de esperar turno en el semáforo.
+    datos = _bytes_del_body(req.body)
+    recibido = length(datos)
+    recibido > CHUNK_SIZE_BYTES && return _error_api(413, "PARTE_INVALIDA",
+        "La parte excede el tamaño máximo de $CHUNK_SIZE_BYTES bytes")
+    esperado = _tamano_esperado_parte(s, indice)
+    recibido == esperado || return _error_api(400, "PARTE_INVALIDA",
+        "La parte $indice debe medir exactamente $esperado bytes (llegaron $recibido)")
+
+    Base.acquire(CHUNK_UPLOAD_SEMAPHORE)
+    try
+        lock(s.lock)
+        try
+            # Re-chequeo con el lock tomado: pudo completarse/cancelarse mientras esperábamos.
+            (s.activa && !_vencida(s)) || return _subida_no_encontrada()
+            # "r+" = lectura/escritura SIN truncar. `seek` a la posición de la
+            # parte: escribir dos veces la misma parte deja los mismos bytes
+            # (idempotente) y el orden de llegada da igual. Se usa `Int64` para
+            # que el desplazamiento no se desborde con archivos de varios GB.
+            escritos = open(s.ruta_tmp, "r+") do io
+                seek(io, Int64(indice) * Int64(CHUNK_SIZE_BYTES))
+                write(io, datos)
+            end
+            escritos == esperado ||
+                error("Escritura incompleta de la parte $indice: $escritos de $esperado bytes")
+            s.recibidas[indice + 1] = true            # los vectores de Julia empiezan en 1
+            s.expira = _ahora_utc() + EXPIRACION_SUBIDA   # renueva el plazo
+            return json_response(200, Dict(
+                "success"         => true,
+                "id_subida"       => s.id_subida,
+                "indice"          => indice,
+                "partes_recibidas"=> count(s.recibidas),   # cuántos `true` hay
+                "total_partes"    => s.total_partes,
+                "expira_en"       => _expira_texto(s)
+            ))
+        finally
+            unlock(s.lock)
+        end
+    catch e
+        return _error_interno("Error escribiendo parte de la subida $(s.id_subida)", e)
+    finally
+        Base.release(CHUNK_UPLOAD_SEMAPHORE)
+    end
+end
+
+# =========================================================
+# POST /api/subidas/:id_subida/completar
+# =========================================================
+function handler_completar_subida(req, params)
+    s = _buscar_sesion(params["id_subida"])
+    isnothing(s) && return _subida_no_encontrada()
+
+    lock(s.lock)
+    try
+        (s.activa && !_vencida(s)) || return _subida_no_encontrada()
+
+        # `findall(!, v)` devuelve las posiciones con `false`; `.- 1` pasa a base 0.
+        faltantes = findall(!, s.recibidas) .- 1
+        if !isempty(faltantes)
+            # NO es terminal: el cliente puede enviar las partes que faltan.
+            return _error_api(400, "SUBIDA_INCOMPLETA",
+                "Faltan $(length(faltantes)) de $(s.total_partes) partes";
+                extra=Dict{String, Any}("partes_faltantes" => first(faltantes, 100),
+                                        "partes_recibidas" => count(s.recibidas),
+                                        "total_partes"     => s.total_partes))
+        end
+        return _publicar_subida!(s)
+    catch e
+        _cerrar_sesion!(s)   # cualquier fallo inesperado aquí es terminal
+        return _error_interno("Error completando la subida $(s.id_subida)", e)
+    finally
+        unlock(s.lock)
+    end
+end
+
+"""
+Publica una subida con todas sus partes (se llama con `s.lock` tomado).
+Desde aquí la sesión termina SIEMPRE: con éxito o con error, se quita del
+Dict y no queda ningún `.partial`. Mismo patrón que la subida directa:
+1. `INSERT` → `UNIQUE(ruta_relativa)` decide si hay colisión (409).
+2. `mv` del `.partial` a su nombre final (sin `force`: nunca sobrescribe).
+   Si falla, se borra la fila recién insertada (compensación).
+"""
+function _publicar_subida!(s::SesionSubida)
+    s.activa = false
+    lock(() -> delete!(_SUBIDAS_ACTIVAS, s.id_subida), _SUBIDAS_LOCK)
+    # Función local: borra el temporal y devuelve la respuesta recibida.
+    abortar(resp) = (_borrar_archivos((s.ruta_tmp,)); resp)
+
+    tam = filesize(s.ruta_tmp)
+    if tam != s.tamano_bytes
+        @error "Tamaño del .partial no coincide" id_subida = s.id_subida tam esperado = s.tamano_bytes
+        return abortar(_error_api(500, "ERROR_INTERNO", "Error interno del servidor"))
+    end
+
+    # El estudio pudo borrarse durante la subida.
+    estudio = obtener_estudio_con_paciente(DB_CONN, s.id_estudio)
+    isnothing(estudio) && return abortar(_error_api(404, "NO_ENCONTRADO", "Estudio no encontrado"))
+    id_paciente = estudio["id_paciente"]::Int
+
+    carpeta = joinpath(PROJECTS_DIR, "_pacientes", "paciente_$(id_paciente)", "estudio_$(s.id_estudio)")
+    mkpath(carpeta)   # si falla, el `catch` del handler cierra la sesión y responde 500
+    ruta_final = joinpath(carpeta, s.nombre_original)
+    registro = (; tipo_archivo    = s.tipo_archivo,
+                  formato         = s.formato,
+                  nombre_original = s.nombre_original,
+                  ruta_relativa   = "_pacientes/paciente_$(id_paciente)/estudio_$(s.id_estudio)/$(s.nombre_original)",
+                  tamano_bytes    = s.tamano_bytes,
+                  metadatos_extra = s.metadatos)
+
+    archivos = try
+        registrar_archivos_medicos(DB_CONN, s.id_estudio, [registro])
+    catch e
+        es_violacion_unica(e) && return abortar(_error_api(409, "ARCHIVO_DUPLICADO",
+            "Ya existe en este estudio un archivo '$(s.nombre_original)' (no se sobrescribe). " *
+            "La subida se descartó."))
+        es_violacion_fk(e) && return abortar(_error_api(404, "NO_ENCONTRADO", "Estudio no encontrado"))
+        rethrow()   # error desconocido: lo maneja el `catch` del handler (500)
+    end
+
+    try
+        mv(s.ruta_tmp, ruta_final; force=false)   # mismo volumen → renombrado atómico
+    catch e
+        ids = [a["id_archivo"] for a in archivos]
+        try
+            eliminar_archivos_medicos(DB_CONN, ids)
+        catch e2
+            @error "Compensación fallida: fila sin archivo en disco" ids exception = (e2, catch_backtrace())
+        end
+        if ispath(ruta_final)
+            @warn "Existe en disco '$ruta_final' sin registro en la BD (huérfano o colisión de mayúsculas)"
+            return abortar(_error_api(409, "ARCHIVO_DUPLICADO",
+                "Ya existe en este estudio un archivo '$(s.nombre_original)' (no se sobrescribe). " *
+                "La subida se descartó."))
+        end
+        rethrow()
+    end
+
+    println("✅ Subida fragmentada completada: '$(s.nombre_original)' ($(s.tamano_bytes) bytes) → estudio $(s.id_estudio)")
+    return json_response(201, Dict("success" => true, "archivo" => first(archivos)))
+end
+
+# =========================================================
+# DELETE /api/subidas/:id_subida — cancela y borra el `.partial`
+# =========================================================
+function handler_cancelar_subida(req, params)
+    # `incluir_vencidas=true`: una sesión vencida aún no limpiada también se puede cancelar.
+    s = _buscar_sesion(params["id_subida"]; incluir_vencidas=true)
+    isnothing(s) && return _subida_no_encontrada()
+
+    lock(s.lock)   # espera a que termine una parte que se esté escribiendo
+    try
+        s.activa || return _subida_no_encontrada()
+        _cerrar_sesion!(s)
+    finally
+        unlock(s.lock)
+    end
+
+    println("🚫 Subida fragmentada $(s.id_subida) cancelada")
+    return json_response(200, Dict("success" => true, "cancelada" => true,
+                                   "id_subida" => s.id_subida))
+end
+
+# =========================================================
 # CATÁLOGOS Y FILTROS DE ARCHIVOS
 # =========================================================
 
@@ -845,7 +1307,14 @@ function handler_catalogos_pacientes(req, params)
         "formatos"      => formatos,
         "max_upload_mb" => MAX_UPLOAD_BYTES ÷ (1024 * 1024),
         "paginacion"    => Dict("limite_defecto" => LIMITE_PACIENTES_DEFECTO,
-                                "limite_maximo"  => LIMITE_PACIENTES_MAXIMO)
+                                "limite_maximo"  => LIMITE_PACIENTES_MAXIMO),
+        # Para que el frontend decida entre subida directa y fragmentada sin
+        # hardcodear constantes.
+        "subida_fragmentada" => Dict(
+            "tamano_parte_mb"       => CHUNK_SIZE_BYTES ÷ _BYTES_POR_MB,
+            "tamano_parte_bytes"    => CHUNK_SIZE_BYTES,
+            "max_upload_mb"         => MAX_CHUNKED_UPLOAD_BYTES ÷ _BYTES_POR_MB,
+            "umbral_recomendado_mb" => UMBRAL_SUBIDA_FRAGMENTADA_MB)
     ))
 end
 
@@ -1007,28 +1476,96 @@ function handler_descargar_archivo(req, params)
         return no_disponible()
     end
 
-    # `read(ruta)` devuelve un `Vector{UInt8}` con todo el archivo. El router
-    # actual no soporta streaming, así que se carga en memoria (el tamaño ya
-    # está acotado por MAX_UPLOAD_BYTES en la subida).
+    # Tamaño REAL en disco (no el de la BD) para calcular rangos.
+    total = Int64(filesize(ruta))
+
+    # --- Header `Range` opcional → 206 Partial Content ---
+    texto_rango = HTTP.header(req, "Range", "")
+    rango = nothing
+    if !isempty(texto_rango)
+        rango = _parsear_rango(texto_rango, total)
+        if isnothing(rango)
+            resp = _error_api(416, "RANGO_INVALIDO",
+                "Rango no válido. Usa un único rango 'bytes=inicio-fin', 'bytes=inicio-' " *
+                "o 'bytes=-N' dentro de 0..$(total - 1)")
+            HTTP.setheader(resp, "Content-Range" => "bytes */$total")   # RFC 9110: tamaño total
+            HTTP.setheader(resp, "Access-Control-Expose-Headers" => "Content-Range")
+            return resp
+        end
+    end
+    # Desestructuración de tupla: sin Range se lee el archivo entero.
+    inicio, fin = isnothing(rango) ? (Int64(0), total - 1) : rango
+    n = fin - inicio + 1
+
+    # El router no soporta streaming: el bloque pedido se carga en RAM. Si es
+    # grande (>= 100 MiB), solo se permite UNA lectura así a la vez; las demás
+    # esperan turno. `grande && f()` ejecuta `f()` solo si `grande` es true.
+    grande = n >= UMBRAL_DESCARGA_GRANDE_BYTES
+    grande && Base.acquire(LARGE_DOWNLOAD_SEMAPHORE)
     bytes = try
-        read(ruta)
+        _leer_bloque(ruta, inicio, n)
     catch e
         isfile(ruta) || return no_disponible()   # se borró justo entre el chequeo y la lectura
         return _error_interno("Error leyendo $ruta", e)
+    finally
+        grande && Base.release(LARGE_DOWNLOAD_SEMAPHORE)
     end
 
-    resp = HTTP.Response(200, bytes)
+    resp = HTTP.Response(isnothing(rango) ? 200 : 206, bytes)
     # Primero CORS (que fija `Content-Type: application/json`) y DESPUÉS lo
     # sobrescribimos: `setheader` reemplaza un header existente.
     HttpUtils.add_cors_headers(resp)
     HTTP.setheader(resp, "Content-Type" => _content_type_descarga(archivo.formato, archivo.nombre_original))
     HTTP.setheader(resp, "Content-Disposition" => _content_disposition(archivo.nombre_original))
     HTTP.setheader(resp, "Content-Length" => string(length(bytes)))
+    HTTP.setheader(resp, "Accept-Ranges" => "bytes")              # anuncia soporte de rangos
+    isnothing(rango) || HTTP.setheader(resp, "Content-Range" => "bytes $inicio-$fin/$total")
     HTTP.setheader(resp, "Cache-Control" => "no-store")            # datos médicos: no cachear
     HTTP.setheader(resp, "X-Content-Type-Options" => "nosniff")    # el navegador no "adivina" el tipo
-    # Sin esto, `fetch` desde otro origen no podría leer el nombre del archivo.
-    HTTP.setheader(resp, "Access-Control-Expose-Headers" => "Content-Disposition, Content-Length")
+    # Sin esto, `fetch` desde otro origen no podría leer estos headers.
+    HTTP.setheader(resp, "Access-Control-Expose-Headers" =>
+                   "Content-Disposition, Content-Length, Content-Range, Accept-Ranges")
     return resp
+end
+
+# Un único rango: `bytes=inicio-fin`, `bytes=inicio-` o `bytes=-N`.
+# `{0,19}` limita los dígitos (Int64 tiene 19) y `[0-9]` evita dígitos Unicode.
+const _REGEX_RANGE = r"^bytes=([0-9]{0,19})-([0-9]{0,19})$"
+
+"""
+Interpreta el header `Range` para un archivo de `total` bytes. Devuelve
+`(inicio, fin)` (base 0, ambos inclusivos, como en HTTP) o `nothing` si es
+inválido o no se puede satisfacer (→ 416). Varios rangos (`bytes=0-1,5-9`)
+no se admiten. Un `fin` mayor que el archivo se recorta al último byte
+(lo permite el estándar). `m.captures` son los textos de los grupos `(...)`.
+"""
+function _parsear_rango(texto::AbstractString, total::Int64)
+    m = match(_REGEX_RANGE, strip(texto))
+    (isnothing(m) || total <= 0) && return nothing
+    txt_inicio, txt_fin = m.captures
+    if isempty(txt_inicio)                       # "bytes=-N": últimos N bytes
+        n = isempty(txt_fin) ? nothing : tryparse(Int64, txt_fin)
+        (isnothing(n) || n == 0) && return nothing
+        return (max(total - n, Int64(0)), total - 1)
+    end
+    inicio = tryparse(Int64, txt_inicio)
+    (isnothing(inicio) || inicio >= total) && return nothing
+    fin = isempty(txt_fin) ? total - 1 : tryparse(Int64, txt_fin)
+    (isnothing(fin) || fin < inicio) && return nothing
+    return (inicio, min(fin, total - 1))
+end
+
+"""
+Lee exactamente `n` bytes desde la posición `inicio` sin cargar el resto del
+archivo: `seek` mueve el cursor y `read(io, n)` lee como máximo `n` bytes.
+"""
+function _leer_bloque(ruta::AbstractString, inicio::Int64, n::Int64)
+    return open(ruta, "r") do io
+        seek(io, inicio)
+        bytes = read(io, n)
+        length(bytes) == n || error("Lectura incompleta de $ruta: $(length(bytes)) de $n bytes")
+        bytes
+    end
 end
 
 # =========================================================
@@ -1286,6 +1823,12 @@ registrar_ruta!("PUT",    "/api/estudios/:id",              handler_actualizar_e
 registrar_ruta!("DELETE", "/api/estudios/:id",              handler_eliminar_estudio)
 registrar_ruta!("GET",    "/api/estudios/:id/archivos",     handler_listar_archivos_estudio)
 registrar_ruta!("POST",   "/api/estudios/:id/archivos",     handler_subir_archivos_estudio)
+registrar_ruta!("POST",   "/api/estudios/:id/subidas",      handler_iniciar_subida)
+
+# --- Subidas fragmentadas (archivos grandes) ---
+registrar_ruta!("PUT",    "/api/subidas/:id_subida/parte",     handler_subir_parte)
+registrar_ruta!("POST",   "/api/subidas/:id_subida/completar", handler_completar_subida)
+registrar_ruta!("DELETE", "/api/subidas/:id_subida",           handler_cancelar_subida)
 
 # --- Archivos médicos ---
 registrar_ruta!("GET",    "/api/archivos/:id/descarga",     handler_descargar_archivo)
