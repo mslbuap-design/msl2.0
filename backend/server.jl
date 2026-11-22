@@ -27,6 +27,8 @@ include(joinpath("src", "directory_scan.jl"))
 include(joinpath("database", "db.jl"));      using .Database
 include(joinpath("database", "schema.jl"));  using .Schema
 include(joinpath("database", "queries.jl")); using .Queries
+include(joinpath("database", "pacientes_schema.jl"));  using .SchemaPacientes
+include(joinpath("database", "pacientes_queries.jl")); using .PacientesQueries
 
 # IMPORTANTE: Intentar cargar NativeFileDialog (opcional)
 NATIVE_FILE_DIALOG_AVAILABLE = false
@@ -70,6 +72,7 @@ const MODO_OPERACION = Ref("julia")
 # Conexión PostgreSQL
 const DB_CONN = Database.connect_db()
 Schema.crear_tablas(DB_CONN)
+SchemaPacientes.crear_tablas_pacientes(DB_CONN)
 
 # Inicializar directorio temporal (fallback para archivos subidos desde el
 # navegador — ver FileResolver)
