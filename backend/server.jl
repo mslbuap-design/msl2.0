@@ -88,6 +88,7 @@ include(joinpath("src", "handlers", "archivos.jl"))
 include(joinpath("src", "handlers", "visualizacion.jl"))
 include(joinpath("src", "handlers", "radiomica.jl"))
 include(joinpath("src", "handlers", "estadistica.jl"))
+include(joinpath("src", "handlers", "pacientes.jl"))
 
 # ==============================================================================
 # ROUTER PRINCIPAL
