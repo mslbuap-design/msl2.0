@@ -100,6 +100,54 @@ function _codigo_paciente_valido(codigo::AbstractString)
     return true
 end
 
+# Mensaje compartido por POST y PUT para que el usuario vea la misma regla.
+const _MENSAJE_CODIGO_INVALIDO =
+    "'codigo_paciente' inválido: usa solo letras, números, '.', '_' o '-' " *
+    "(sin espacios, '/', '\\' ni '..'; sin '.' final; no puede ser un " *
+    "nombre reservado como CON o COM1; máx. 64 caracteres)"
+
+"""
+`true` si el body JSON trae la clave `campo`, AUNQUE su valor sea `null`.
+Así distinguimos "campo omitido" (no se cambia) de "campo = null" (limpiar).
+`JSON3.Object` guarda las claves como `Symbol`, por eso `Symbol(campo)`.
+"""
+_campo_presente(body, campo::AbstractString) = haskey(body, Symbol(campo))
+
+"""
+Lee los parámetros `?clave=valor` de la URL. Devuelve `(Dict, nothing)` o
+`(nothing, respuesta_400)` si la URL está mal codificada (`%zz`) o algún
+valor decodificado no es UTF-8 válido.
+"""
+function _leer_query(req)
+    query = try
+        HTTP.URIs.queryparams(HTTP.URI(req.target))
+    catch
+        return (nothing, _error_api(400, "DATOS_INVALIDOS", "La URL de la consulta está mal codificada"))
+    end
+    all(isvalid, values(query)) ||
+        return (nothing, _error_api(400, "DATOS_INVALIDOS",
+            "Los parámetros de la URL deben ser texto UTF-8 válido"))
+    return (query, nothing)
+end
+
+"""
+Lee un entero de la query (`?limite=20`). Devuelve `(valor, nothing)` o
+`(nothing, "mensaje")`. Ausente → `defecto`. Exige solo dígitos ASCII (como
+`_id_valido`) y usa `tryparse`, que devuelve `nothing` en vez de lanzar
+error si el número no cabe en un `Int`. `maximo=nothing` = sin tope.
+"""
+function _entero_query(query, nombre::AbstractString, defecto::Int, minimo::Int,
+                       maximo::Union{Int, Nothing}=nothing)
+    texto = get(query, nombre, nothing)
+    isnothing(texto) && return (defecto, nothing)
+    n = (!isempty(texto) && all(c -> '0' <= c <= '9', texto)) ? tryparse(Int, texto) : nothing
+    if isnothing(n) || n < minimo || (!isnothing(maximo) && n > maximo)
+        rango = isnothing(maximo) ? ">= $minimo" : "entre $minimo y $maximo"
+        return (nothing, "'$nombre' debe ser un entero $rango")
+    end
+    return (n, nothing)
+end
+
 """
 Lee del body un campo de texto opcional. Devuelve una tupla `(valor, error)`:
 - campo ausente o `null`  -> `(nothing, nothing)`
@@ -174,12 +222,8 @@ function handler_crear_paciente(req, params)
         return _error_api(400, "DATOS_INVALIDOS", "'codigo_paciente' es obligatorio")
     end
     codigo = String(codigo)
-    if !_codigo_paciente_valido(codigo)
-        return _error_api(400, "DATOS_INVALIDOS",
-            "'codigo_paciente' inválido: usa solo letras, números, '.', '_' o '-' " *
-            "(sin espacios, '/', '\\' ni '..'; sin '.' final; no puede ser un " *
-            "nombre reservado como CON o COM1; máx. 64 caracteres)")
-    end
+    _codigo_paciente_valido(codigo) ||
+        return _error_api(400, "DATOS_INVALIDOS", _MENSAJE_CODIGO_INVALIDO)
 
     # --- opcionales de texto ---
     nombre, err = _texto_opcional(body, "nombre")
@@ -214,27 +258,41 @@ function handler_crear_paciente(req, params)
 end
 
 # =========================================================
-# GET /api/pacientes?buscar=...   (alias aceptado: ?q=..., ver SPEC.md)
+# GET /api/pacientes?buscar=...&limite=20&desplazamiento=0
+# (alias aceptado: ?q=... en lugar de ?buscar=...)
 # =========================================================
+
+# Paginación del listado. También se publican en /api/pacientes/catalogos
+# para que el frontend nunca se desincronice de estos valores.
+const LIMITE_PACIENTES_DEFECTO = 20
+const LIMITE_PACIENTES_MAXIMO  = 100
+
 function handler_listar_pacientes(req, params)
+    # `queryparams` convierte "?buscar=PAC&x=1" en Dict("buscar"=>"PAC","x"=>"1").
+    query, err = _leer_query(req)
+    isnothing(err) || return err
+
+    busqueda = get(query, "buscar", get(query, "q", nothing))
+    if !isnothing(busqueda) && length(busqueda) > 255
+        return _error_api(400, "DATOS_INVALIDOS", "'buscar' admite hasta 255 caracteres")
+    end
+
+    limite, err = _entero_query(query, "limite", LIMITE_PACIENTES_DEFECTO,
+                                1, LIMITE_PACIENTES_MAXIMO)
+    isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+    desplazamiento, err = _entero_query(query, "desplazamiento", 0, 0)
+    isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+
     try
-        # `queryparams` convierte "?buscar=PAC&x=1" en Dict("buscar"=>"PAC","x"=>"1").
-        # Decodificar `%zz` (o un `%` suelto) lanza error: es culpa del cliente → 400.
-        busqueda = try
-            query = HTTP.URIs.queryparams(HTTP.URI(req.target))
-            get(query, "buscar", get(query, "q", nothing))
-        catch
-            return _error_api(400, "DATOS_INVALIDOS", "La URL de la consulta está mal codificada")
-        end
-
-        # `isvalid` comprueba que los bytes decodificados sean UTF-8 válido.
-        if !isnothing(busqueda) && (!isvalid(busqueda) || length(busqueda) > 255)
-            return _error_api(400, "DATOS_INVALIDOS",
-                "'buscar' debe ser texto UTF-8 de hasta 255 caracteres")
-        end
-
-        pacientes = listar_pacientes(DB_CONN; busqueda=busqueda)
-        return json_response(200, Dict("success" => true, "pacientes" => pacientes))
+        # `; busqueda, limite` es azúcar de Julia para `busqueda=busqueda, ...`.
+        resultado = listar_pacientes(DB_CONN; busqueda, limite, desplazamiento)
+        return json_response(200, Dict(
+            "success"        => true,
+            "pacientes"      => resultado.pacientes,
+            "total"          => resultado.total,
+            "limite"         => limite,
+            "desplazamiento" => desplazamiento
+        ))
     catch e
         return _error_interno("Error listando pacientes", e)
     end
@@ -286,6 +344,36 @@ function handler_crear_estudio(req, params)
     end
 end
 
+"""
+Completa `paciente` (Dict) con `estudios` y, dentro de cada estudio, sus
+`archivos`. El `!` del nombre es la convención de Julia para "modifica su
+argumento". Lo comparten `GET /api/pacientes/:id` y
+`GET /api/pacientes/codigo/:codigo` para que ambas respuestas sean idénticas.
+"""
+function _anidar_estudios_y_archivos!(paciente::AbstractDict)
+    id_paciente = paciente["id_paciente"]::Int
+
+    # Ya vienen ordenados (más reciente primero) desde la query.
+    estudios = listar_estudios_paciente(DB_CONN, id_paciente)
+
+    # Una sola consulta para todos los archivos; luego los agrupamos en
+    # memoria por id_estudio. `get!(f, dict, clave)` devuelve el vector
+    # de esa clave, creándolo con `f()` si todavía no existe.
+    archivos_por_estudio = Dict{Int, Vector{Dict{String, Any}}}()
+    for archivo in listar_archivos_paciente(DB_CONN, id_paciente)
+        lista = get!(() -> Dict{String, Any}[], archivos_por_estudio, archivo["id_estudio"])
+        push!(lista, archivo)
+    end
+
+    for estudio in estudios
+        estudio["archivos"] = get(archivos_por_estudio, estudio["id_estudio"],
+                                  Dict{String, Any}[])
+    end
+
+    paciente["estudios"] = estudios
+    return paciente
+end
+
 # =========================================================
 # GET /api/pacientes/:id — paciente + estudios + archivos anidados
 # =========================================================
@@ -296,28 +384,37 @@ function handler_obtener_paciente(req, params)
     try
         paciente = obtener_paciente(DB_CONN, id_paciente)
         isnothing(paciente) && return _error_api(404, "NO_ENCONTRADO", "Paciente no encontrado")
-
-        # Ya vienen ordenados (más reciente primero) desde la query.
-        estudios = listar_estudios_paciente(DB_CONN, id_paciente)
-
-        # Una sola consulta para todos los archivos; luego los agrupamos en
-        # memoria por id_estudio. `get!(f, dict, clave)` devuelve el vector
-        # de esa clave, creándolo con `f()` si todavía no existe.
-        archivos_por_estudio = Dict{Int, Vector{Dict{String, Any}}}()
-        for archivo in listar_archivos_paciente(DB_CONN, id_paciente)
-            lista = get!(() -> Dict{String, Any}[], archivos_por_estudio, archivo["id_estudio"])
-            push!(lista, archivo)
-        end
-
-        for estudio in estudios
-            estudio["archivos"] = get(archivos_por_estudio, estudio["id_estudio"],
-                                      Dict{String, Any}[])
-        end
-
-        paciente["estudios"] = estudios
+        _anidar_estudios_y_archivos!(paciente)
         return json_response(200, Dict("success" => true, "paciente" => paciente))
     catch e
         return _error_interno("Error obteniendo paciente $id_paciente", e)
+    end
+end
+
+# =========================================================
+# GET /api/pacientes/codigo/:codigo — igual que /:id, buscando por código
+# (exacto, sin distinguir mayúsculas)
+# =========================================================
+function handler_obtener_paciente_por_codigo(req, params)
+    # El router entrega el segmento tal cual viene en la URL; lo decodificamos
+    # (`%41` → `A`). Si la decodificación falla, el código es inválido.
+    codigo = try
+        HTTP.URIs.unescapeuri(params["codigo"])
+    catch
+        nothing
+    end
+    # `isvalid` va primero: la regex no debe recibir UTF-8 corrupto.
+    if isnothing(codigo) || !isvalid(codigo) || !_codigo_paciente_valido(codigo)
+        return _error_api(400, "DATOS_INVALIDOS", _MENSAJE_CODIGO_INVALIDO)
+    end
+
+    try
+        paciente = obtener_paciente_por_codigo(DB_CONN, codigo)
+        isnothing(paciente) && return _error_api(404, "NO_ENCONTRADO", "Paciente no encontrado")
+        _anidar_estudios_y_archivos!(paciente)
+        return json_response(200, Dict("success" => true, "paciente" => paciente))
+    catch e
+        return _error_interno("Error obteniendo paciente con código '$codigo'", e)
     end
 end
 
@@ -699,10 +796,499 @@ function _procesar_subida(req, id_estudio::Int)
 end
 
 # =========================================================
+# CATÁLOGOS Y FILTROS DE ARCHIVOS
+# =========================================================
+
+# Formatos válidos derivados de la MISMA tabla que usa la subida (así nunca
+# se desincronizan). `last.(v)` aplica `last` a cada par (`".nii" => "NIfTI"`
+# → `"NIfTI"`); `unique` conserva el orden de primera aparición.
+const FORMATOS_PERMITIDOS = unique(last.(_FORMATOS_POR_EXTENSION))
+
+"""
+Valida el filtro opcional `?tipo_archivo=`. Vacío/ausente → sin filtro.
+Devuelve `(valor_normalizado_o_nothing, nothing)` o `(nothing, "mensaje")`.
+"""
+function _filtro_tipo_archivo(texto)
+    (isnothing(texto) || isempty(strip(texto))) && return (nothing, nothing)
+    tipo = lowercase(strip(texto))
+    tipo in TIPOS_ARCHIVO_PERMITIDOS && return (tipo, nothing)
+    return (nothing, "'tipo_archivo' inválido. Permitidos: $(join(TIPOS_ARCHIVO_PERMITIDOS, ", "))")
+end
+
+"""
+Valida el filtro opcional `?formato=` sin distinguir mayúsculas y lo
+devuelve con la grafía canónica de la BD (`"nifti"` → `"NIfTI"`).
+"""
+function _filtro_formato(texto)
+    (isnothing(texto) || isempty(strip(texto))) && return (nothing, nothing)
+    buscado = lowercase(strip(texto))
+    i = findfirst(f -> lowercase(f) == buscado, FORMATOS_PERMITIDOS)
+    isnothing(i) &&
+        return (nothing, "'formato' inválido. Permitidos: $(join(FORMATOS_PERMITIDOS, ", "))")
+    return (FORMATOS_PERMITIDOS[i], nothing)
+end
+
+# =========================================================
+# GET /api/pacientes/catalogos — valores que el frontend necesita
+# =========================================================
+function handler_catalogos_pacientes(req, params)
+    # Comprensión con filtro: por cada formato, sus extensiones (en el orden
+    # de `_FORMATOS_POR_EXTENSION`).
+    formatos = [Dict{String, Any}(
+                    "formato"     => f,
+                    "extensiones" => [ext for (ext, fmt) in _FORMATOS_POR_EXTENSION if fmt == f])
+                for f in FORMATOS_PERMITIDOS]
+
+    return json_response(200, Dict(
+        "success"       => true,
+        "tipos_archivo" => TIPOS_ARCHIVO_PERMITIDOS,
+        "formatos"      => formatos,
+        "max_upload_mb" => MAX_UPLOAD_BYTES ÷ (1024 * 1024),
+        "paginacion"    => Dict("limite_defecto" => LIMITE_PACIENTES_DEFECTO,
+                                "limite_maximo"  => LIMITE_PACIENTES_MAXIMO)
+    ))
+end
+
+# =========================================================
+# GET /api/estudios/:id — estudio + archivos anidados
+# =========================================================
+function handler_obtener_estudio(req, params)
+    id_estudio = _id_valido(params["id"])
+    isnothing(id_estudio) && return _error_api(400, "ID_INVALIDO", "id de estudio inválido")
+
+    try
+        estudio = obtener_estudio_con_paciente(DB_CONN, id_estudio)
+        isnothing(estudio) && return _error_api(404, "NO_ENCONTRADO", "Estudio no encontrado")
+        estudio["archivos"] = listar_archivos_estudio(DB_CONN, id_estudio)
+        return json_response(200, Dict("success" => true, "estudio" => estudio))
+    catch e
+        return _error_interno("Error obteniendo estudio $id_estudio", e)
+    end
+end
+
+# =========================================================
+# GET /api/estudios/:id/archivos?tipo_archivo=...&formato=...
+# =========================================================
+function handler_listar_archivos_estudio(req, params)
+    id_estudio = _id_valido(params["id"])
+    isnothing(id_estudio) && return _error_api(400, "ID_INVALIDO", "id de estudio inválido")
+
+    query, err = _leer_query(req)
+    isnothing(err) || return err
+    tipo_archivo, err = _filtro_tipo_archivo(get(query, "tipo_archivo", nothing))
+    isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+    formato, err = _filtro_formato(get(query, "formato", nothing))
+    isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+
+    try
+        # Distinguimos "estudio inexistente" (404) de "estudio sin archivos" ([]).
+        isnothing(obtener_estudio_con_paciente(DB_CONN, id_estudio)) &&
+            return _error_api(404, "NO_ENCONTRADO", "Estudio no encontrado")
+        archivos = listar_archivos_estudio(DB_CONN, id_estudio; tipo_archivo, formato)
+        return json_response(200, Dict("success" => true,
+                                       "id_estudio" => id_estudio,
+                                       "archivos" => archivos))
+    catch e
+        return _error_interno("Error listando archivos del estudio $id_estudio", e)
+    end
+end
+
+# =========================================================
+# GET /api/archivos/:id — metadatos públicos (sin rutas internas)
+# =========================================================
+function handler_obtener_archivo(req, params)
+    id_archivo = _id_valido(params["id"])
+    isnothing(id_archivo) && return _error_api(400, "ID_INVALIDO", "id de archivo inválido")
+
+    try
+        archivo = obtener_archivo_medico(DB_CONN, id_archivo)
+        isnothing(archivo) && return _error_api(404, "NO_ENCONTRADO", "Archivo no encontrado")
+        return json_response(200, Dict("success" => true, "archivo" => archivo))
+    catch e
+        return _error_interno("Error obteniendo archivo $id_archivo", e)
+    end
+end
+
+# =========================================================
+# HELPERS DE DISCO (descarga y borrado)
+# =========================================================
+
+"""
+Reconstruye la ruta física a partir de `ruta_relativa` (guardada con `/`).
+Defensa en profundidad: aunque la BD solo contiene rutas que escribimos
+nosotros, se rechaza cualquier segmento vacío, `.`, `..` o con `\\`, y la
+ruta debe colgar de `_pacientes/`. Devuelve la ruta o `nothing`.
+`joinpath(PROJECTS_DIR, partes...)` usa el separador del sistema operativo;
+los `...` ("splat") pasan cada elemento del vector como un argumento.
+"""
+function _ruta_fisica(ruta_relativa::AbstractString)
+    partes = split(ruta_relativa, '/')
+    (length(partes) >= 2 && partes[1] == "_pacientes") || return nothing
+    any(p -> isempty(p) || p in (".", "..") || occursin('\\', p), partes) && return nothing
+    return joinpath(PROJECTS_DIR, partes...)
+end
+
+_carpeta_paciente(id_paciente::Integer) =
+    joinpath(PROJECTS_DIR, "_pacientes", "paciente_$(id_paciente)")
+
+_carpeta_estudio(id_paciente::Integer, id_estudio::Integer) =
+    joinpath(_carpeta_paciente(id_paciente), "estudio_$(id_estudio)")
+
+"""
+Borra en disco DESPUÉS de haber borrado en la BD. Si falla (p.ej. un archivo
+abierto en Windows) solo se registra con `@error`: el registro ya no existe,
+así que la respuesta sigue siendo 200. Devuelve `true` si se pudo limpiar.
+`force=true` ignora rutas inexistentes; `recursive=true` borra carpetas.
+"""
+function _borrar_en_disco(ruta::AbstractString; recursive::Bool=false)
+    try
+        rm(ruta; recursive=recursive, force=true)
+        return true
+    catch e
+        @error "No se pudo borrar en disco (el registro ya se eliminó de la BD)" ruta exception = (e, catch_backtrace())
+        return false
+    end
+end
+
+"""
+`Content-Type` de la descarga según formato/extensión. `.nii.gz` se sirve
+como gzip (es lo que es); un `.nii` sin comprimir no tiene tipo MIME
+estándar → `application/octet-stream`.
+"""
+function _content_type_descarga(formato, nombre::AbstractString)
+    n = lowercase(nombre)
+    endswith(n, ".nii.gz") && return "application/gzip"
+    formato == "DICOM" && return "application/dicom"
+    formato == "PDF"   && return "application/pdf"
+    formato == "PNG"   && return "image/png"
+    formato == "CSV"   && return "text/csv; charset=utf-8"
+    formato == "ZIP"   && return "application/zip"
+    endswith(n, ".xlsx") && return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    endswith(n, ".xls")  && return "application/vnd.ms-excel"
+    return "application/octet-stream"
+end
+
+"""
+Header `Content-Disposition` seguro. `filename="..."` lleva una versión
+ASCII saneada (sin comillas, `\\` ni caracteres de control/no ASCII, que se
+cambian por `_`); `filename*=UTF-8''...` (RFC 6266/5987) lleva el nombre
+real codificado con `%XX` para los navegadores modernos.
+"""
+function _content_disposition(nombre::AbstractString)
+    # `map` sobre un String aplica la función a cada carácter y devuelve un String.
+    nombre_ascii = map(c -> (isascii(c) && !iscntrl(c) && c != '"' && c != '\\') ? c : '_', nombre)
+    return "attachment; filename=\"$nombre_ascii\"; filename*=UTF-8''$(HTTP.URIs.escapeuri(nombre))"
+end
+
+# =========================================================
+# GET /api/archivos/:id/descarga — bytes del archivo
+# =========================================================
+function handler_descargar_archivo(req, params)
+    id_archivo = _id_valido(params["id"])
+    isnothing(id_archivo) && return _error_api(400, "ID_INVALIDO", "id de archivo inválido")
+
+    archivo = try
+        obtener_archivo_medico_interno(DB_CONN, id_archivo)
+    catch e
+        return _error_interno("Error consultando archivo $id_archivo para descarga", e)
+    end
+    isnothing(archivo) && return _error_api(404, "NO_ENCONTRADO", "Archivo no encontrado")
+
+    ruta = _ruta_fisica(archivo.ruta_relativa)
+    if isnothing(ruta)
+        @error "ruta_relativa inesperada en la BD" id_archivo ruta_relativa = archivo.ruta_relativa
+        return _error_api(500, "ERROR_INTERNO", "Error interno del servidor")
+    end
+
+    no_disponible() = _error_api(404, "ARCHIVO_NO_DISPONIBLE",
+        "El archivo está registrado pero no se encuentra en el servidor")
+    if !isfile(ruta)
+        @warn "Archivo registrado en BD pero ausente en disco" id_archivo ruta
+        return no_disponible()
+    end
+
+    # `read(ruta)` devuelve un `Vector{UInt8}` con todo el archivo. El router
+    # actual no soporta streaming, así que se carga en memoria (el tamaño ya
+    # está acotado por MAX_UPLOAD_BYTES en la subida).
+    bytes = try
+        read(ruta)
+    catch e
+        isfile(ruta) || return no_disponible()   # se borró justo entre el chequeo y la lectura
+        return _error_interno("Error leyendo $ruta", e)
+    end
+
+    resp = HTTP.Response(200, bytes)
+    # Primero CORS (que fija `Content-Type: application/json`) y DESPUÉS lo
+    # sobrescribimos: `setheader` reemplaza un header existente.
+    HttpUtils.add_cors_headers(resp)
+    HTTP.setheader(resp, "Content-Type" => _content_type_descarga(archivo.formato, archivo.nombre_original))
+    HTTP.setheader(resp, "Content-Disposition" => _content_disposition(archivo.nombre_original))
+    HTTP.setheader(resp, "Content-Length" => string(length(bytes)))
+    HTTP.setheader(resp, "Cache-Control" => "no-store")            # datos médicos: no cachear
+    HTTP.setheader(resp, "X-Content-Type-Options" => "nosniff")    # el navegador no "adivina" el tipo
+    # Sin esto, `fetch` desde otro origen no podría leer el nombre del archivo.
+    HTTP.setheader(resp, "Access-Control-Expose-Headers" => "Content-Disposition, Content-Length")
+    return resp
+end
+
+# =========================================================
+# EDICIÓN PARCIAL (PUT)
+# =========================================================
+#
+# Regla común: campo OMITIDO → no se toca; campo con `null` → se limpia
+# (si la columna lo admite). Se valida todo ANTES de tocar la BD y se arma
+# un `Vector{Pair}` con los cambios que `PacientesQueries` convierte en un
+# único `UPDATE ... RETURNING`.
+
+_sin_campos_editables(campos) = _error_api(400, "DATOS_INVALIDOS",
+    "No se envió ningún campo editable. Campos permitidos: $(join(campos, ", "))")
+
+# PUT /api/pacientes/:id   body: {codigo_paciente?, nombre?, datos_clinicos?, notas?}
+function handler_actualizar_paciente(req, params)
+    id_paciente = _id_valido(params["id"])
+    isnothing(id_paciente) && return _error_api(400, "ID_INVALIDO", "id de paciente inválido")
+
+    body, err = _leer_objeto_json(req)
+    isnothing(err) || return err
+
+    cambios = Pair{String, Any}[]
+
+    if _campo_presente(body, "codigo_paciente")
+        codigo = get(body, "codigo_paciente", nothing)
+        # Es obligatorio en la BD: `null` o texto inválido → 400.
+        (codigo isa AbstractString && _codigo_paciente_valido(String(codigo))) ||
+            return _error_api(400, "DATOS_INVALIDOS", _MENSAJE_CODIGO_INVALIDO)
+        push!(cambios, "codigo_paciente" => String(codigo))
+    end
+
+    if _campo_presente(body, "nombre")
+        nombre, err = _texto_opcional(body, "nombre")   # null o "" → nothing (limpiar)
+        isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+        push!(cambios, "nombre" => nombre)
+    end
+
+    if _campo_presente(body, "notas")
+        notas, err = _texto_opcional(body, "notas"; max_largo=10_000)
+        isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+        push!(cambios, "notas" => notas)
+    end
+
+    if _campo_presente(body, "datos_clinicos")
+        datos = get(body, "datos_clinicos", nothing)
+        (isnothing(datos) || datos isa JSON3.Object) ||
+            return _error_api(400, "DATOS_INVALIDOS", "'datos_clinicos' debe ser un objeto JSON o null")
+        push!(cambios, "datos_clinicos" => datos)
+    end
+
+    isempty(cambios) &&
+        return _sin_campos_editables(("codigo_paciente", "nombre", "datos_clinicos", "notas"))
+
+    try
+        paciente = actualizar_paciente(DB_CONN, id_paciente, cambios)
+        isnothing(paciente) && return _error_api(404, "NO_ENCONTRADO", "Paciente no encontrado")
+        println("✏️ Paciente $id_paciente actualizado")
+        return json_response(200, Dict("success" => true, "paciente" => paciente))
+    catch e
+        es_violacion_unica(e) && return _error_api(409, "PACIENTE_DUPLICADO",
+            "Ya existe otro paciente con ese codigo_paciente " *
+            "(no se distinguen mayúsculas/minúsculas)")
+        return _error_interno("Error actualizando paciente $id_paciente", e)
+    end
+end
+
+# PUT /api/estudios/:id   body: {modalidad?, fecha_estudio?, descripcion?}
+function handler_actualizar_estudio(req, params)
+    id_estudio = _id_valido(params["id"])
+    isnothing(id_estudio) && return _error_api(400, "ID_INVALIDO", "id de estudio inválido")
+
+    body, err = _leer_objeto_json(req)
+    isnothing(err) || return err
+
+    cambios = Pair{String, Any}[]
+
+    if _campo_presente(body, "modalidad")
+        modalidad, err = _texto_opcional(body, "modalidad")
+        isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+        push!(cambios, "modalidad" => (isnothing(modalidad) ? nothing : uppercase(modalidad)))
+    end
+
+    if _campo_presente(body, "descripcion")
+        descripcion, err = _texto_opcional(body, "descripcion"; max_largo=10_000)
+        isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+        push!(cambios, "descripcion" => descripcion)
+    end
+
+    if _campo_presente(body, "fecha_estudio")
+        fecha_texto, err = _texto_opcional(body, "fecha_estudio")
+        isnothing(err) || return _error_api(400, "DATOS_INVALIDOS", err)
+        fecha_estudio = nothing   # null → limpiar la fecha
+        if !isnothing(fecha_texto)
+            dt = _parsear_fecha_iso(fecha_texto)   # acepta el formato de JS con `Z`
+            isnothing(dt) && return _error_api(400, "DATOS_INVALIDOS",
+                "'fecha_estudio' debe ser ISO-8601: 'AAAA-MM-DD', 'AAAA-MM-DDTHH:MM:SS' " *
+                "o 'AAAA-MM-DDTHH:MM:SS.sssZ' (UTC)")
+            fecha_estudio = string(dt)
+        end
+        push!(cambios, "fecha_estudio" => fecha_estudio)
+    end
+
+    isempty(cambios) &&
+        return _sin_campos_editables(("modalidad", "fecha_estudio", "descripcion"))
+
+    try
+        estudio = actualizar_estudio(DB_CONN, id_estudio, cambios)
+        isnothing(estudio) && return _error_api(404, "NO_ENCONTRADO", "Estudio no encontrado")
+        println("✏️ Estudio $id_estudio actualizado")
+        return json_response(200, Dict("success" => true, "estudio" => estudio))
+    catch e
+        return _error_interno("Error actualizando estudio $id_estudio", e)
+    end
+end
+
+# PUT /api/archivos/:id   body: {tipo_archivo?, metadatos_extra?}
+# No renombra ni mueve el archivo físico.
+function handler_actualizar_archivo(req, params)
+    id_archivo = _id_valido(params["id"])
+    isnothing(id_archivo) && return _error_api(400, "ID_INVALIDO", "id de archivo inválido")
+
+    body, err = _leer_objeto_json(req)
+    isnothing(err) || return err
+
+    cambios = Pair{String, Any}[]
+
+    if _campo_presente(body, "tipo_archivo")
+        tipo = get(body, "tipo_archivo", nothing)
+        # Columna obligatoria: `null` no se admite.
+        tipo_ok = tipo isa AbstractString ? lowercase(strip(tipo)) : nothing
+        (!isnothing(tipo_ok) && tipo_ok in TIPOS_ARCHIVO_PERMITIDOS) ||
+            return _error_api(400, "DATOS_INVALIDOS",
+                "'tipo_archivo' inválido. Permitidos: $(join(TIPOS_ARCHIVO_PERMITIDOS, ", "))")
+        push!(cambios, "tipo_archivo" => String(tipo_ok))
+    end
+
+    if _campo_presente(body, "metadatos_extra")
+        metadatos = get(body, "metadatos_extra", nothing)
+        (isnothing(metadatos) || metadatos isa AbstractDict) ||
+            return _error_api(400, "DATOS_INVALIDOS", "'metadatos_extra' debe ser un objeto JSON o null")
+        push!(cambios, "metadatos_extra" => metadatos)
+    end
+
+    isempty(cambios) && return _sin_campos_editables(("tipo_archivo", "metadatos_extra"))
+
+    try
+        archivo = actualizar_archivo_medico(DB_CONN, id_archivo, cambios)
+        isnothing(archivo) && return _error_api(404, "NO_ENCONTRADO", "Archivo no encontrado")
+        println("✏️ Archivo $id_archivo actualizado")
+        return json_response(200, Dict("success" => true, "archivo" => archivo))
+    catch e
+        return _error_interno("Error actualizando archivo $id_archivo", e)
+    end
+end
+
+# =========================================================
+# BORRADO (DELETE): primero BD (atómico), luego disco (best effort)
+# =========================================================
+#
+# ¿Por qué en ese orden? Si borráramos primero el disco y luego fallara la
+# BD, quedarían filas apuntando a archivos inexistentes. Al revés, lo peor
+# que puede pasar es un archivo huérfano en disco (se registra con @error).
+# `DELETE ... RETURNING` borra y nos dice qué borró en una sola sentencia:
+# no hace falta un SELECT previo (sin carrera entre "comprobar" y "borrar").
+
+# DELETE /api/archivos/:id
+function handler_eliminar_archivo(req, params)
+    id_archivo = _id_valido(params["id"])
+    isnothing(id_archivo) && return _error_api(400, "ID_INVALIDO", "id de archivo inválido")
+
+    borrado = try
+        eliminar_archivo_medico(DB_CONN, id_archivo)
+    catch e
+        return _error_interno("Error eliminando archivo $id_archivo", e)
+    end
+    isnothing(borrado) && return _error_api(404, "NO_ENCONTRADO", "Archivo no encontrado")
+
+    ruta = _ruta_fisica(borrado.ruta_relativa)
+    limpio = if isnothing(ruta)
+        @error "ruta_relativa inesperada; no se borra nada en disco" id_archivo ruta_relativa = borrado.ruta_relativa
+        false
+    else
+        _borrar_en_disco(ruta)
+    end
+
+    println("🗑️ Archivo $id_archivo eliminado")
+    return json_response(200, Dict("success" => true, "eliminado" => true,
+                                   "id_archivo" => id_archivo,
+                                   "limpieza_disco" => limpio))
+end
+
+# DELETE /api/estudios/:id   (la cascada borra sus archivos_medicos)
+function handler_eliminar_estudio(req, params)
+    id_estudio = _id_valido(params["id"])
+    isnothing(id_estudio) && return _error_api(400, "ID_INVALIDO", "id de estudio inválido")
+
+    borrado = try
+        eliminar_estudio(DB_CONN, id_estudio)
+    catch e
+        return _error_interno("Error eliminando estudio $id_estudio", e)
+    end
+    isnothing(borrado) && return _error_api(404, "NO_ENCONTRADO", "Estudio no encontrado")
+
+    limpio = _borrar_en_disco(_carpeta_estudio(borrado.id_paciente, borrado.id_estudio);
+                              recursive=true)
+
+    println("🗑️ Estudio $id_estudio eliminado (paciente $(borrado.id_paciente))")
+    return json_response(200, Dict("success" => true, "eliminado" => true,
+                                   "id_estudio" => id_estudio,
+                                   "id_paciente" => borrado.id_paciente,
+                                   "limpieza_disco" => limpio))
+end
+
+# DELETE /api/pacientes/:id   (la cascada borra estudios y archivos)
+function handler_eliminar_paciente(req, params)
+    id_paciente = _id_valido(params["id"])
+    isnothing(id_paciente) && return _error_api(400, "ID_INVALIDO", "id de paciente inválido")
+
+    borrado = try
+        eliminar_paciente(DB_CONN, id_paciente)
+    catch e
+        return _error_interno("Error eliminando paciente $id_paciente", e)
+    end
+    isnothing(borrado) && return _error_api(404, "NO_ENCONTRADO", "Paciente no encontrado")
+
+    limpio = _borrar_en_disco(_carpeta_paciente(id_paciente); recursive=true)
+
+    println("🗑️ Paciente $id_paciente eliminado")
+    return json_response(200, Dict("success" => true, "eliminado" => true,
+                                   "id_paciente" => id_paciente,
+                                   "limpieza_disco" => limpio))
+end
+
+# =========================================================
 # REGISTRO DE RUTAS
 # =========================================================
-registrar_ruta!("GET",  "/api/pacientes", handler_listar_pacientes)
-registrar_ruta!("POST", "/api/pacientes", handler_crear_paciente)
-registrar_ruta!("GET",  "/api/pacientes/:id", handler_obtener_paciente)
-registrar_ruta!("POST", "/api/pacientes/:id/estudios", handler_crear_estudio)
-registrar_ruta!("POST", "/api/estudios/:id/archivos", handler_subir_archivos_estudio)
+# El router devuelve la PRIMERA ruta que coincide. Por eso las rutas
+# estáticas o más específicas (`/catalogos`, `/codigo/:codigo`) se registran
+# ANTES que `/api/pacientes/:id`: si no, "catalogos" se capturaría como `:id`.
+
+# --- Pacientes ---
+registrar_ruta!("GET",    "/api/pacientes/catalogos",       handler_catalogos_pacientes)
+registrar_ruta!("GET",    "/api/pacientes/codigo/:codigo",  handler_obtener_paciente_por_codigo)
+registrar_ruta!("GET",    "/api/pacientes",                 handler_listar_pacientes)
+registrar_ruta!("POST",   "/api/pacientes",                 handler_crear_paciente)
+registrar_ruta!("GET",    "/api/pacientes/:id",             handler_obtener_paciente)
+registrar_ruta!("PUT",    "/api/pacientes/:id",             handler_actualizar_paciente)
+registrar_ruta!("DELETE", "/api/pacientes/:id",             handler_eliminar_paciente)
+registrar_ruta!("POST",   "/api/pacientes/:id/estudios",    handler_crear_estudio)
+
+# --- Estudios ---
+registrar_ruta!("GET",    "/api/estudios/:id",              handler_obtener_estudio)
+registrar_ruta!("PUT",    "/api/estudios/:id",              handler_actualizar_estudio)
+registrar_ruta!("DELETE", "/api/estudios/:id",              handler_eliminar_estudio)
+registrar_ruta!("GET",    "/api/estudios/:id/archivos",     handler_listar_archivos_estudio)
+registrar_ruta!("POST",   "/api/estudios/:id/archivos",     handler_subir_archivos_estudio)
+
+# --- Archivos médicos ---
+registrar_ruta!("GET",    "/api/archivos/:id/descarga",     handler_descargar_archivo)
+registrar_ruta!("GET",    "/api/archivos/:id",              handler_obtener_archivo)
+registrar_ruta!("PUT",    "/api/archivos/:id",              handler_actualizar_archivo)
+registrar_ruta!("DELETE", "/api/archivos/:id",              handler_eliminar_archivo)

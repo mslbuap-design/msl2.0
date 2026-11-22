@@ -27,10 +27,13 @@ using LibPQ
 using JSON3
 using Dates
 
-export crear_paciente, obtener_paciente, listar_pacientes
+export crear_paciente, obtener_paciente, obtener_paciente_por_codigo, listar_pacientes
+export actualizar_paciente, eliminar_paciente
 export crear_estudio, obtener_estudio_con_paciente, listar_estudios_paciente
-export registrar_archivos_medicos, listar_archivos_paciente
-export obtener_archivo_medico_interno, eliminar_archivos_medicos
+export actualizar_estudio, eliminar_estudio
+export registrar_archivos_medicos, listar_archivos_paciente, listar_archivos_estudio
+export obtener_archivo_medico, obtener_archivo_medico_interno
+export actualizar_archivo_medico, eliminar_archivo_medico, eliminar_archivos_medicos
 export es_violacion_unica, es_violacion_fk
 
 # =========================================================
@@ -123,6 +126,46 @@ function _arreglo_pg(valores)
     end
     print(io, '}')
     return String(take!(io))
+end
+
+"""
+    _actualizar_fila(conn, tabla, columna_id, id, cambios, editables, retorno) -> fila o nothing
+
+Arma y ejecuta un `UPDATE ... RETURNING` SOLO con las columnas recibidas
+(edición parcial). `cambios` es una colección de pares `"columna" => valor`
+(`nothing` → NULL, es decir, "limpiar"). `editables` es la lista blanca
+`columna => cast SQL` (`""`, `"::jsonb"`, `"::timestamp"`):
+- los NOMBRES de columna nunca vienen del usuario: se comprueban contra esa
+  lista, así interpolarlos en el SQL es seguro;
+- los VALORES viajan como parámetros `\$2, \$3, ...` (`\$1` es el id).
+Siempre actualiza `fecha_actualizacion` en UTC. Devuelve la fila de
+`RETURNING` o `nothing` si no existe el id.
+"""
+function _actualizar_fila(conn, tabla::AbstractString, columna_id::AbstractString,
+                          id::Integer, cambios, editables::AbstractDict,
+                          retorno::AbstractString)
+    isempty(cambios) && throw(ArgumentError("No hay columnas que actualizar"))
+
+    valores = Any[id]            # `Any[...]`: vector que admite tipos mezclados
+    asignaciones = String[]
+    for (columna, valor) in cambios
+        cast = get(editables, columna, nothing)
+        isnothing(cast) && throw(ArgumentError("Columna no editable: $columna"))
+        push!(valores, cast == "::jsonb" ? _jsonb_a_sql(valor) : _a_sql(valor))
+        # `\$` es un `$` literal y `$(...)` interpola: "nombre = \$2"
+        push!(asignaciones, "$columna = \$$(length(valores))$cast")
+    end
+    push!(asignaciones, "fecha_actualizacion = NOW() AT TIME ZONE 'UTC'")
+
+    sql = """
+    UPDATE $tabla
+    SET $(join(asignaciones, ", "))
+    WHERE $columna_id = \$1
+    RETURNING $retorno;
+    """
+
+    filas = collect(execute(conn, sql, valores))
+    return isempty(filas) ? nothing : filas[1]
 end
 
 # =========================================================
@@ -234,36 +277,135 @@ function obtener_paciente(conn, id_paciente::Integer)
 end
 
 """
-    listar_pacientes(conn; busqueda=nothing) -> Vector{Dict}
+    obtener_paciente_por_codigo(conn, codigo) -> Dict o nothing
 
-Lista todos los pacientes (más recientes primero; el `id` desempata, igual
-que el índice `idx_pacientes_orden`). Si `busqueda` trae texto, filtra por
-`codigo_paciente` o `nombre` que lo contengan, sin distinguir
-mayúsculas/minúsculas (`ILIKE`). El mismo parámetro `\$1` se usa dos veces.
+Busca por coincidencia EXACTA sin distinguir mayúsculas. Se escribe
+`lower(codigo_paciente) = lower(\$1)` (y no `ILIKE`) para que PostgreSQL
+pueda usar el índice único sobre `lower(codigo_paciente)` y para que `_` o
+`%` no actúen como comodines. Como el índice es único, hay 0 o 1 fila.
 """
-function listar_pacientes(conn; busqueda=nothing)
+function obtener_paciente_por_codigo(conn, codigo::AbstractString)
 
-    if isnothing(busqueda) || isempty(strip(busqueda))
-        sql = """
-        SELECT $_COLUMNAS_PACIENTE
-        FROM pacientes
-        ORDER BY fecha_creacion DESC, id_paciente DESC;
-        """
-        result = execute(conn, sql)
-    else
-        patron = "%" * _escapar_like(strip(busqueda)) * "%"
-        sql = """
-        SELECT $_COLUMNAS_PACIENTE
-        FROM pacientes
-        WHERE codigo_paciente ILIKE \$1
-           OR nombre ILIKE \$1
-        ORDER BY fecha_creacion DESC, id_paciente DESC;
-        """
-        result = execute(conn, sql, [patron])
-    end
+    sql = """
+    SELECT $_COLUMNAS_PACIENTE
+    FROM pacientes
+    WHERE lower(codigo_paciente) = lower(\$1);
+    """
 
-    # Comprensión de arreglo: aplica `_fila_paciente` a cada fila del resultado.
-    return [_fila_paciente(f) for f in result]
+    filas = collect(execute(conn, sql, [String(codigo)]))
+    isempty(filas) && return nothing
+    return _fila_paciente(filas[1])
+
+end
+
+# Resumen para el listado: SIN `datos_clinicos` ni `notas` (no inflar la
+# respuesta ni exponer datos clínicos en una vista de tabla).
+function _fila_resumen_paciente(f)
+    return Dict{String, Any}(
+        "id_paciente"          => _id(f[1]),
+        "codigo_paciente"      => f[2],
+        "nombre"               => _desde_sql(f[3]),
+        "fecha_creacion"       => _fecha_texto(f[4]),
+        "fecha_actualizacion"  => _fecha_texto(f[5]),
+        "num_estudios"         => Int(f[6]),          # COUNT(*) llega como Int64
+        "ultima_fecha_estudio" => _fecha_texto(f[7])  # MAX(...) es NULL si no hay fechas
+    )
+end
+
+"""
+    listar_pacientes(conn; busqueda, limite, desplazamiento) -> (; pacientes, total)
+
+Listado RESUMIDO y paginado (más recientes primero; el `id` desempata para
+que el orden sea estable entre páginas). Si `busqueda` trae texto, filtra
+por `codigo_paciente` o `nombre` que lo contengan (`ILIKE`, sin distinguir
+mayúsculas). Devuelve una NamedTuple: `pacientes` (la página) y `total`
+(cuántos pacientes cumplen el filtro, para que el frontend pinte la
+paginación).
+
+`\$1::text IS NULL OR ...` permite usar UN solo SQL con o sin filtro: si
+no hay búsqueda se envía NULL y la condición es siempre verdadera.
+El `LEFT JOIN LATERAL` es una subconsulta que se evalúa "por cada paciente"
+(puede ver `p.id_paciente`); con `COUNT`/`MAX` sin `GROUP BY` siempre
+devuelve exactamente una fila (0 / NULL si no tiene estudios).
+"""
+function listar_pacientes(conn; busqueda=nothing, limite::Integer=20,
+                          desplazamiento::Integer=0)
+
+    patron = (isnothing(busqueda) || isempty(strip(busqueda))) ? missing :
+             "%" * _escapar_like(strip(busqueda)) * "%"
+
+    # Interpolar `filtro` es seguro: es texto fijo nuestro, el valor va en `\$1`.
+    filtro = "(\$1::text IS NULL OR p.codigo_paciente ILIKE \$1 OR p.nombre ILIKE \$1)"
+
+    sql_total = """
+    SELECT COUNT(*)
+    FROM pacientes p
+    WHERE $filtro;
+    """
+    total = Int(first(execute(conn, sql_total, Any[patron]))[1])
+
+    sql = """
+    SELECT p.id_paciente, p.codigo_paciente, p.nombre,
+           p.fecha_creacion, p.fecha_actualizacion,
+           s.num_estudios, s.ultima_fecha_estudio
+    FROM pacientes p
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*)             AS num_estudios,
+               MAX(e.fecha_estudio) AS ultima_fecha_estudio
+        FROM estudios e
+        WHERE e.id_paciente = p.id_paciente
+    ) s ON TRUE
+    WHERE $filtro
+    ORDER BY p.fecha_creacion DESC, p.id_paciente DESC
+    LIMIT \$2 OFFSET \$3;
+    """
+    result = execute(conn, sql, Any[patron, limite, desplazamiento])
+
+    # Comprensión de arreglo: aplica `_fila_resumen_paciente` a cada fila.
+    pacientes = [_fila_resumen_paciente(f) for f in result]
+    return (; pacientes = pacientes, total = total)
+
+end
+
+# Lista blanca de columnas editables con PUT (columna => cast SQL).
+const _EDITABLES_PACIENTE = Dict(
+    "codigo_paciente" => "",
+    "nombre"          => "",
+    "datos_clinicos"  => "::jsonb",
+    "notas"           => ""
+)
+
+"""
+    actualizar_paciente(conn, id_paciente, cambios) -> Dict o nothing
+
+Edición parcial: solo cambia las columnas presentes en `cambios` (pares
+`"columna" => valor`; `nothing` limpia la columna). Devuelve el paciente
+actualizado o `nothing` si no existe. Si el nuevo `codigo_paciente` choca
+con otro, LibPQ lanza una violación UNIQUE (el handler responde 409).
+"""
+function actualizar_paciente(conn, id_paciente::Integer, cambios)
+    fila = _actualizar_fila(conn, "pacientes", "id_paciente", id_paciente,
+                            cambios, _EDITABLES_PACIENTE, _COLUMNAS_PACIENTE)
+    return isnothing(fila) ? nothing : _fila_paciente(fila)
+end
+
+"""
+    eliminar_paciente(conn, id_paciente) -> Int o nothing
+
+Borra el paciente con UNA sentencia (atómica). `ON DELETE CASCADE` elimina
+también sus estudios y archivos_medicos. Devuelve el id borrado o `nothing`
+si no existía (así no hace falta un SELECT previo).
+"""
+function eliminar_paciente(conn, id_paciente::Integer)
+
+    sql = """
+    DELETE FROM pacientes
+    WHERE id_paciente = \$1
+    RETURNING id_paciente;
+    """
+
+    filas = collect(execute(conn, sql, [id_paciente]))
+    return isempty(filas) ? nothing : Int(filas[1][1])
 
 end
 
@@ -364,6 +506,46 @@ function listar_estudios_paciente(conn, id_paciente::Integer)
     """
 
     return [_fila_estudio(f) for f in execute(conn, sql, [id_paciente])]
+
+end
+
+const _EDITABLES_ESTUDIO = Dict(
+    "modalidad"     => "",
+    "fecha_estudio" => "::timestamp",   # texto ISO (UTC, sin Z) ya validado
+    "descripcion"   => ""
+)
+
+"""
+    actualizar_estudio(conn, id_estudio, cambios) -> Dict o nothing
+
+Edición parcial del estudio (ver `_actualizar_fila`). En `UPDATE` el alias
+`AS e` permite reutilizar `RETURNING $_COLUMNAS_ESTUDIO` (columnas `e.`);
+en el `SET` las columnas van sin alias, como exige PostgreSQL.
+"""
+function actualizar_estudio(conn, id_estudio::Integer, cambios)
+    fila = _actualizar_fila(conn, "estudios AS e", "e.id_estudio", id_estudio,
+                            cambios, _EDITABLES_ESTUDIO, _COLUMNAS_ESTUDIO)
+    return isnothing(fila) ? nothing : _fila_estudio(fila)
+end
+
+"""
+    eliminar_estudio(conn, id_estudio) -> NamedTuple o nothing
+
+Borra el estudio en una sola sentencia; la cascada elimina sus
+archivos_medicos. Devuelve `(; id_estudio, id_paciente)` (el handler lo
+necesita para ubicar la carpeta en disco) o `nothing` si no existía.
+"""
+function eliminar_estudio(conn, id_estudio::Integer)
+
+    sql = """
+    DELETE FROM estudios
+    WHERE id_estudio = \$1
+    RETURNING id_estudio, id_paciente;
+    """
+
+    filas = collect(execute(conn, sql, [id_estudio]))
+    isempty(filas) && return nothing
+    return (; id_estudio = Int(filas[1][1]), id_paciente = Int(filas[1][2]))
 
 end
 
@@ -525,6 +707,89 @@ function listar_archivos_paciente(conn, id_paciente::Integer)
     """
 
     return [_fila_archivo(f) for f in execute(conn, sql, [id_paciente])]
+
+end
+
+"""
+    listar_archivos_estudio(conn, id_estudio; tipo_archivo, formato) -> Vector{Dict}
+
+Archivos (forma pública) de un estudio, en orden de subida. Los filtros son
+opcionales: si llegan como `nothing` se envían NULL y `\$2::text IS NULL`
+hace que esa condición no filtre nada. Los valores ya vienen validados y
+normalizados por el handler.
+"""
+function listar_archivos_estudio(conn, id_estudio::Integer;
+                                 tipo_archivo=nothing, formato=nothing)
+
+    sql = """
+    SELECT $_COLUMNAS_ARCHIVO
+    FROM archivos_medicos a
+    WHERE a.id_estudio = \$1
+      AND (\$2::text IS NULL OR a.tipo_archivo = \$2)
+      AND (\$3::text IS NULL OR a.formato = \$3)
+    ORDER BY a.fecha_subida, a.id_archivo;
+    """
+
+    params = Any[id_estudio, _a_sql(tipo_archivo), _a_sql(formato)]
+    return [_fila_archivo(f) for f in execute(conn, sql, params)]
+
+end
+
+"""
+    obtener_archivo_medico(conn, id_archivo) -> Dict o nothing
+
+Forma PÚBLICA del archivo (con `url_descarga`, sin `ruta_relativa`).
+"""
+function obtener_archivo_medico(conn, id_archivo::Integer)
+
+    sql = """
+    SELECT $_COLUMNAS_ARCHIVO
+    FROM archivos_medicos a
+    WHERE a.id_archivo = \$1;
+    """
+
+    filas = collect(execute(conn, sql, [id_archivo]))
+    isempty(filas) && return nothing
+    return _fila_archivo(filas[1])
+
+end
+
+const _EDITABLES_ARCHIVO = Dict(
+    "tipo_archivo"    => "",
+    "metadatos_extra" => "::jsonb"
+)
+
+"""
+    actualizar_archivo_medico(conn, id_archivo, cambios) -> Dict o nothing
+
+Edición parcial de metadatos del archivo. NO toca el archivo físico ni su
+`ruta_relativa` (no está en la lista blanca). Devuelve la forma pública.
+"""
+function actualizar_archivo_medico(conn, id_archivo::Integer, cambios)
+    fila = _actualizar_fila(conn, "archivos_medicos AS a", "a.id_archivo", id_archivo,
+                            cambios, _EDITABLES_ARCHIVO, _COLUMNAS_ARCHIVO)
+    return isnothing(fila) ? nothing : _fila_archivo(fila)
+end
+
+"""
+    eliminar_archivo_medico(conn, id_archivo) -> NamedTuple o nothing
+
+USO INTERNO. Borra UN registro (distinto de `eliminar_archivos_medicos`,
+que es la compensación en lote de la subida) y devuelve
+`(; id_archivo, ruta_relativa)` para que el handler borre el archivo en
+disco. `nothing` si no existía. La `ruta_relativa` NO debe enviarse al cliente.
+"""
+function eliminar_archivo_medico(conn, id_archivo::Integer)
+
+    sql = """
+    DELETE FROM archivos_medicos
+    WHERE id_archivo = \$1
+    RETURNING id_archivo, ruta_relativa;
+    """
+
+    filas = collect(execute(conn, sql, [id_archivo]))
+    isempty(filas) && return nothing
+    return (; id_archivo = Int(filas[1][1]), ruta_relativa = String(filas[1][2]))
 
 end
 
